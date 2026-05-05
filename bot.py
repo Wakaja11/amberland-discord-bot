@@ -7,9 +7,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from collections import defaultdict
-
-# Для RCON
-from mcrcon import MCRcon, MCRconException
+from aiomcrcon import Client, RCONConnectionError, IncorrectPasswordError
 
 # ========================= НАСТРОЙКИ =========================
 
@@ -86,9 +84,8 @@ def is_admin(member: discord.Member) -> bool:
     admin_ids = {ADMIN_ROLE_ID_1, ADMIN_ROLE_ID_2}
     return any(role.id in admin_ids for role in member.roles)
 
-# ======================== RCON (АСИНХРОННЫЙ) ========================
 
-from aiomcrcon import Client, RCONConnectionError, IncorrectPasswordError
+# ======================== RCON ========================
 
 async def execute_rcon(command: str) -> str:
     """Выполняет команду через RCON (асинхронно)"""
@@ -98,9 +95,8 @@ async def execute_rcon(command: str) -> str:
     try:
         async with Client(RCON_HOST, RCON_PORT, RCON_PASSWORD) as client:
             response = await client.send_cmd(command)
-            print(f"[RCON] ✓ {command} → {response}")
+            print(f"[RCON] {command} -> {response}")
             return response.strip() if response else "Выполнено успешно"
-
     except IncorrectPasswordError:
         return "RCON: Неверный пароль"
     except RCONConnectionError as e:
@@ -119,7 +115,7 @@ async def ask_openrouter(ticket_id: int, user_message: str) -> str:
     try:
         system_prompt = (
             "Ты дружелюбный и опытный помощник Minecraft-сервера AmberLand. "
-            "Версия сервера: 1.21.11. Все игроки играют с ПК (Java Edition). "
+            "Версия сервера: 1.21. Все игроки играют с ПК (Java Edition). "
             "Отвечай игрокам вежливо, кратко и на русском языке. "
             "Не грузи игроков сложной информацией, "
             "давай полезные советы по игре. Администраторы сервера - aTrapCW, Wakaja11"
@@ -460,7 +456,7 @@ class TicketView(ui.View):
             embed = discord.Embed(title="Ваша заявка одобрена!", description="Поздравляем! Вы приняты на наш Minecraft сервер.", color=discord.Color.green())
             embed.add_field(name="Никнейм", value=nickname, inline=False)
             embed.add_field(name="Администратор", value=f"{admin}", inline=False)
-            embed.add_field(name="Что дальше?", value="Зайди на сервер по IP: `amberland.fun`")
+            embed.add_field(name="Что дальше?", value="Зайди на сервер по IP: amberland.fun")
             await user.send(embed=embed)
         except:
             pass
@@ -876,7 +872,7 @@ async def setup(ctx):
         await apply_channel.purge(limit=10)
         embed = discord.Embed(
             title="Привет! Здесь ты можешь оставить заявку на сервер",
-            description="Нажми кнопку ниже, чтобы подать заявку и присоединениться к AmberLand!",
+            description="Нажми кнопку ниже, чтобы подать заявку и присоединиться к AmberLand!",
             color=discord.Color(0xffbf00)
         )
         await apply_channel.send(embed=embed, view=ApplyView())
