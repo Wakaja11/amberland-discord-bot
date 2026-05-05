@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from collections import defaultdict
 
+# Для RCON
+from mcrcon import MCRcon, MCRconException
+
 # ========================= НАСТРОЙКИ =========================
 
 load_dotenv()
@@ -15,11 +18,17 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# ==================== RCON НАСТРОЙКИ ====================
+RCON_HOST = os.getenv("RCON_HOST", "127.0.0.1")
+RCON_PORT = int(os.getenv("RCON_PORT", 25575))
+RCON_PASSWORD = os.getenv("RCON_PASSWORD")
+
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN не найден")
 
 print(f"DISCORD_TOKEN: {'Да' if TOKEN else 'Нет'}")
 print(f"OPENROUTER_API_KEY: {'Да' if OPENROUTER_API_KEY else 'Нет'}")
+print(f"RCON: {RCON_HOST}:{RCON_PORT} — {'Настроен' if RCON_PASSWORD else 'ПАРОЛЬ НЕ УКАЗАН!'}")
 
 # OpenRouter клиент
 openrouter_client = AsyncOpenAI(
@@ -70,7 +79,6 @@ owner_to_channel = {}
 channel_to_owner = {}
 channel_is_private = {}
 
-# История диалога с ИИ
 conversation_history = defaultdict(list)
 
 
@@ -79,7 +87,32 @@ def is_admin(member: discord.Member) -> bool:
     return any(role.id in admin_ids for role in member.roles)
 
 
-# ======================== OPENROUTER AI ПОМОЩНИК ========================
+# ======================== RCON ========================
+
+async def execute_rcon(command: str) -> str:
+    """Выполняет команду через RCON"""
+    if not RCON_PASSWORD:
+        return "RCON не настроен (нет пароля в .env)"
+
+    try:
+        def sync_rcon():
+            with MCRcon(RCON_HOST, RCON_PASSWORD, port=RCON_PORT, timeout=5) as mcr:
+                response = mcr.command(command)
+                return response.strip()
+
+        response = await asyncio.to_thread(sync_rcon)
+        print(f"[RCON] ✓ {command} → {response}")
+        return response or "Выполнено успешно"
+
+    except MCRconException as e:
+        print(f"[RCON ERROR] {e}")
+        return f"RCON ошибка: {e}"
+    except Exception as e:
+        print(f"[RCON ERROR] {e}")
+        return f"Не удалось подключиться к RCON: {str(e)[:100]}"
+
+
+# ======================== OPENROUTER AI ========================
 
 async def ask_openrouter(ticket_id: int, user_message: str) -> str:
     if not openrouter_client:
@@ -91,7 +124,7 @@ async def ask_openrouter(ticket_id: int, user_message: str) -> str:
             "Версия сервера: 1.21.11. Все игроки играют с ПК (Java Edition). "
             "Отвечай игрокам вежливо, кратко и на русском языке. "
             "Не грузи игроков сложной информацией, "
-            "давай полезные советы по игре."
+            "давай полезные советы по игре. Администраторы сервера - aTrapCW, Wakaja11"
         )
 
         conversation_history[ticket_id].append({"role": "user", "content": user_message})
@@ -156,7 +189,7 @@ async def update_stats():
                 pass
 
 
-# ======================== АВТО-РОЛЬ ПРИ ВХОДЕ ========================
+# ======================== АВТО-РОЛЬ ========================
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -359,7 +392,7 @@ class AskAIModal(ui.Modal, title="Спросить ИИ"):
         await interaction.followup.send(embed=embed)
 
 
-# ======================== КНОПКИ И ТИКЕТЫ ========================
+# ======================== КНОПКИ ========================
 
 class ApplyView(ui.View):
     def __init__(self):
@@ -404,8 +437,12 @@ class TicketView(ui.View):
 
         await interaction.response.defer(ephemeral=True)
         admin = interaction.user
-        nickname = self.nickname
+        nickname = self.nickname.strip()
 
+        # Добавление в whitelist через RCON
+        rcon_result = await execute_rcon(f"whitelist add {nickname}")
+
+        # Выдача роли
         try:
             member = await interaction.guild.fetch_member(self.applicant_id)
             player_role = interaction.guild.get_role(PLAYER_ROLE_ID)
@@ -419,39 +456,32 @@ class TicketView(ui.View):
         except:
             pass
 
+        # Сообщение игроку
         try:
             user = await bot.fetch_user(self.applicant_id)
             embed = discord.Embed(title="Ваша заявка одобрена!", description="Поздравляем! Вы приняты на наш Minecraft сервер.", color=discord.Color.green())
             embed.add_field(name="Никнейм", value=nickname, inline=False)
             embed.add_field(name="Администратор", value=f"{admin}", inline=False)
             embed.add_field(name="Что дальше?", value="Зайди на сервер по IP: `amberland.fun`")
-            embed.add_field(name="Приятной игры на AmberLand!", value="", inline=False)
             await user.send(embed=embed)
         except:
             pass
 
-        status = ""
-        try:
-            console_channel = interaction.guild.get_channel(CONSOLE_CHANNEL_ID)
-            if console_channel:
-                await console_channel.send(f"swl add {nickname}")
-                status = "и команда `swl add` отправлена в консоль"
-        except:
-            status = "(ошибка отправки команды)"
-
+        # Логи
         log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
         if log_channel:
             embed = discord.Embed(title="Заявка принята", color=discord.Color.green(), timestamp=discord.utils.utcnow())
             embed.add_field(name="Игрок", value=f"<@{self.applicant_id}>", inline=False)
             embed.add_field(name="Никнейм", value=nickname, inline=False)
             embed.add_field(name="Администратор", value=f"{admin} ({admin.id})", inline=False)
+            embed.add_field(name="RCON", value=rcon_result, inline=False)
             await log_channel.send(embed=embed)
 
         disabled_view = ui.View()
         disabled_view.add_item(ui.Button(label="Принять", style=discord.ButtonStyle.success, disabled=True))
         disabled_view.add_item(ui.Button(label="Отклонить", style=discord.ButtonStyle.danger, disabled=True))
 
-        await interaction.edit_original_response(content=f"Заявка принята {status}", view=disabled_view)
+        await interaction.edit_original_response(content=f"Заявка принята | {rcon_result}", view=disabled_view)
         await interaction.followup.send("Заявка успешно одобрена!", ephemeral=True)
 
         try:
