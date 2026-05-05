@@ -86,32 +86,28 @@ def is_admin(member: discord.Member) -> bool:
     admin_ids = {ADMIN_ROLE_ID_1, ADMIN_ROLE_ID_2}
     return any(role.id in admin_ids for role in member.roles)
 
-# ======================== RCON ========================
+# ======================== RCON (АСИНХРОННЫЙ) ========================
+
+from aiomcrcon import Client, RCONConnectionError, IncorrectPasswordError
 
 async def execute_rcon(command: str) -> str:
-    """Выполняет команду через RCON"""
+    """Выполняет команду через RCON (асинхронно)"""
     if not RCON_PASSWORD:
         return "RCON не настроен (нет пароля в .env)"
 
     try:
-        def sync_rcon_exec():
-            with MCRcon(RCON_HOST, RCON_PASSWORD, port=RCON_PORT, timeout=5) as mcr:
-                response = mcr.command(command)
-                return response.strip() if response else "Выполнено"
+        async with Client(RCON_HOST, RCON_PORT, RCON_PASSWORD) as client:
+            response = await client.send_cmd(command)
+            print(f"[RCON] ✓ {command} → {response}")
+            return response.strip() if response else "Выполнено успешно"
 
-        # Более безопасный способ для хостингов
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, sync_rcon_exec)
-        
-        print(f"[RCON] ✓ {command} → {response}")
-        return response
-
-    except MCRconException as e:
-        print(f"[RCON ERROR] {e}")
-        return f"RCON ошибка: {e}"
+    except IncorrectPasswordError:
+        return "RCON: Неверный пароль"
+    except RCONConnectionError as e:
+        return f"RCON: Не удалось подключиться — {e}"
     except Exception as e:
         print(f"[RCON ERROR] {type(e).__name__}: {e}")
-        return f"Не удалось подключиться к RCON: {str(e)[:120]}"
+        return f"RCON ошибка: {str(e)[:100]}"
 
 
 # ======================== OPENROUTER AI ========================
