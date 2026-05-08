@@ -447,6 +447,8 @@ class TicketView(ui.View):
 
         # Добавление в whitelist через RCON
         rcon_result = await execute_rcon(f"whitelist add {nickname}")
+        if "Added" in rcon_result or "уже в" in rcon_result.lower():
+            await execute_rcon("whitelist reload")
 
         # Выдача роли
         try:
