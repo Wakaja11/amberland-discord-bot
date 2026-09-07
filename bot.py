@@ -473,6 +473,33 @@ async def delete_ticket(channel: discord.TextChannel, action: str, fields: dict[
         pass
 
 
+def is_ticket(channel: object) -> bool:
+    return isinstance(channel, discord.TextChannel) and channel.category_id == TICKET_CATEGORY_ID and owner(channel, TICKET_PREFIX) is not None
+
+
+@bot.tree.command(name="add", description="Добавить пользователя в текущее обращение")
+@app_commands.describe(user="Пользователь, которому нужно открыть доступ")
+async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) -> None:
+    roles = await staff(interaction)
+    if not roles or not interaction.guild or not is_ticket(interaction.channel):
+        if roles:
+            await interaction.response.send_message("Команду можно использовать только в канале обращения", ephemeral=True)
+        return
+    await interaction.channel.set_permissions(
+        user,
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        reason=f"Добавлен в обращение {interaction.user}",
+    )
+    await bot.log(interaction.guild, "Пользователь добавлен в обращение", {
+        "Модератор": interaction.user.mention,
+        "Пользователь": user.mention,
+        "Обращение": interaction.channel.mention,
+    })
+    await interaction.response.send_message(f"{user.mention} добавлен в обращение", ephemeral=True)
+
+
 class TicketCloseForm(discord.ui.Modal, title="Закрытие обращения"):
     solution = discord.ui.TextInput(label="Решение", required=True, style=discord.TextStyle.paragraph, max_length=1500)
 
