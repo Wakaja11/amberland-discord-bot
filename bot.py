@@ -31,6 +31,7 @@ GUEST_ROLE_ID = 1485642937860620518
 PLAYER_ROLE_ID = 1485642979556327445
 HELPER_ROLE_ID = 1486339038402183338
 ADMIN_ROLE_ID = 1486338979300380753
+GUILD_ID = 1484230925473546292
 
 APPLICATION_PANEL_COLOR_HTML = "#FFD700"
 APPLICATION_EMBED_COLOR_HTML = "#FFD700"
@@ -152,7 +153,9 @@ class Bot(commands.Bot):
                 logging.exception("Не удалось отправить лог")
 
     async def setup_hook(self) -> None:
-        await self.tree.sync()
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
 
     async def on_ready(self) -> None:
         if self.started:
