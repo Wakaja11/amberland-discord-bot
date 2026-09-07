@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+bot_state.sqlite3
+bot_state.sqlite3-shm
+bot_state.sqlite3-wal
