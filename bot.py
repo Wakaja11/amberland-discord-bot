@@ -391,6 +391,7 @@ class ApplicationDecision(discord.ui.View):
 
 
 FORMS = {
+    "bug": ("Баг-репорт", (("Ваш никнейм", True), ("Описание бага", True), ("Как повторить баг?", True), ("Версия игры или сборки (если известна)", False))),
     "login": ("Проблема со входом", (("Ваш никнейм", True), ("Что именно не работает?", True), ("Когда возникла проблема?", False))),
     "player": ("Жалоба на игрока", (("Ваш никнейм", True), ("Никнейм нарушителя", True), ("Что случилось?", True))),
     "territory": ("Вопрос о территории", (("Ваш никнейм", True), ("Название территории или координаты", True), ("Ваш вопрос", True))),
@@ -406,7 +407,7 @@ class HelpForm(discord.ui.Modal):
         super().__init__(title=title[:45])
         self.kind = kind
         self.inputs: list[discord.ui.TextInput] = []
-        long = {"Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите ситуацию"}
+        long = {"Описание бага", "Как повторить баг?", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите ситуацию"}
         for label, required in fields:
             item = discord.ui.TextInput(label=label, required=required, style=discord.TextStyle.paragraph if label in long else discord.TextStyle.short, max_length=1000)
             self.inputs.append(item)
