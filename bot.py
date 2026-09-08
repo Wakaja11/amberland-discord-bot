@@ -155,8 +155,8 @@ class Bot(commands.Bot):
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+        await self.tree.sync()
 
     async def on_ready(self) -> None:
         if self.started:
@@ -485,6 +485,7 @@ def is_ticket(channel: object) -> bool:
 
 
 @bot.tree.command(name="add", description="Добавить пользователя в текущее обращение")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(user="Пользователь, которому нужно открыть доступ")
 async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) -> None:
     roles = await staff(interaction)
@@ -710,6 +711,7 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
 
 
 @bot.tree.command(name="setup", description="Проверить панели бота")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(administrator=True)
 async def setup(interaction: discord.Interaction) -> None:
     if not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
