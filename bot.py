@@ -261,7 +261,6 @@ async def restore(guild: discord.Guild) -> None:
 
 
 class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
-    name = discord.ui.TextInput(label="Имя", required=True, max_length=100)
     nickname = discord.ui.TextInput(label="Никнейм", required=True, max_length=100)
     about = discord.ui.TextInput(label="Кратко о себе", required=True, style=discord.TextStyle.paragraph, max_length=1000)
     source = discord.ui.TextInput(label="Откуда узнали про нас?", required=False, max_length=300)
@@ -291,7 +290,6 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         for label, value, inline in (
             ("Пользователь", interaction.user.mention, False),
-            ("Имя", self.name.value, True),
             ("Никнейм", self.nickname.value, True),
             ("Кратко о себе", self.about.value, False),
             ("Откуда узнали про нас?", self.source.value or "Не указано", False),
@@ -300,7 +298,6 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=ApplicationDecision(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
         await bot.log(interaction.guild, "Новая заявка", {
             "Пользователь": f"{interaction.user.mention} ({interaction.user})",
-            "Имя": self.name.value,
             "Никнейм": self.nickname.value,
             "Кратко о себе": self.about.value,
             "Откуда узнали": self.source.value or "Не указано",
