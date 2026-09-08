@@ -262,6 +262,7 @@ async def restore(guild: discord.Guild) -> None:
 
 class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
     nickname = discord.ui.TextInput(label="Никнейм", required=True, max_length=100)
+    age = discord.ui.TextInput(label="Возраст", required=True, max_length=3)
     about = discord.ui.TextInput(label="Кратко о себе", required=True, style=discord.TextStyle.paragraph, max_length=1000)
     source = discord.ui.TextInput(label="Откуда узнали про нас?", required=False, max_length=300)
 
@@ -291,6 +292,7 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         for label, value, inline in (
             ("Пользователь", interaction.user.mention, False),
             ("Никнейм", self.nickname.value, True),
+            ("Возраст", self.age.value, True),
             ("Кратко о себе", self.about.value, False),
             ("Откуда узнали про нас?", self.source.value or "Не указано", False),
         ):
@@ -299,6 +301,7 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         await bot.log(interaction.guild, "Новая заявка", {
             "Пользователь": f"{interaction.user.mention} ({interaction.user})",
             "Никнейм": self.nickname.value,
+            "Возраст": self.age.value,
             "Кратко о себе": self.about.value,
             "Откуда узнали": self.source.value or "Не указано",
         })
