@@ -25,7 +25,7 @@ RCON_HOST = os.getenv("RCON_HOST", "")
 RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 RCON_TIMEOUT_SECONDS = 10
-WHITELIST_COMMAND = "whitelist add {nickname}"
+WHITELIST_COMMAND = "/whitelist add {nickname}"
 
 APPLICATION_PANEL_CHANNEL_ID = 1486337529954304080
 HELP_PANEL_CHANNEL_ID = 1495766775734865930
@@ -487,28 +487,11 @@ class ApplicationDecision(discord.ui.View):
         details["Пользователь"] = applicant.mention
         details.setdefault("Никнейм", nickname)
         await interaction.response.defer(ephemeral=True)
-        if RCON_ENABLED:
-            command = WHITELIST_COMMAND.format(nickname=nickname)
-            try:
-                response = await whitelist_player(nickname)
-            except RconError as error:
-                await bot.log(interaction.guild, "RCON • ошибка добавления в белый список", {
-                    "Никнейм": nickname,
-                    "Команда": command,
-                    "Ошибка": str(error),
-                }, avatar_url=str(applicant.display_avatar.url))
-                await interaction.followup.send(f"Не удалось добавить игрока в белый список: {error}", ephemeral=True)
-                return
-            await bot.log(interaction.guild, "RCON • игрок добавлен в белый список", {
-                "Никнейм": nickname,
-                "Команда": command,
-                "Ответ сервера": response or "Команда выполнена без текстового ответа",
-            }, avatar_url=str(applicant.display_avatar.url))
-        else:
-            await bot.log(interaction.guild, "RCON • добавление в белый список пропущено", {
-                "Никнейм": nickname,
-                "Причина": "RCON_ENABLED выключен",
-            }, avatar_url=str(applicant.display_avatar.url))
+        try:
+            await whitelist_player(nickname)
+        except RconError as error:
+            await interaction.followup.send(f"Не удалось добавить игрока в белый список: {error}", ephemeral=True)
+            return
         await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
         await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
