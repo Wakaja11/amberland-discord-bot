@@ -687,10 +687,12 @@ class TicketControls(discord.ui.View):
 class SlotsForm(discord.ui.Modal, title="Количество мест"):
     slots = discord.ui.TextInput(label="Сколько мест будет в войсе?", required=True, max_length=2, placeholder="1–99")
 
-    def __init__(self, voice_id: int, user_id: int) -> None:
+    def __init__(self, voice_id: int, user_id: int, closed: bool, control_message: discord.Message) -> None:
         super().__init__()
         self.voice_id = voice_id
         self.user_id = user_id
+        self.closed = closed
+        self.control_message = control_message
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         voice, roles = await voice_access(interaction, self.voice_id, self.user_id)
@@ -703,9 +705,38 @@ class SlotsForm(discord.ui.Modal, title="Количество мест"):
         except ValueError:
             await interaction.response.send_message("Введите целое число от 1 до 99", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
         await voice.edit(user_limit=value, reason=f"Лимит изменён {interaction.user}")
-        await interaction.delete_original_response()
+        try:
+            await self.control_message.edit(view=VoiceControls(self.voice_id, self.user_id, self.closed))
+        except discord.HTTPException:
+            logging.exception("Не удалось обновить панель управления войсом %s", self.voice_id)
+        await interaction.response.send_message(f"Лимит участников изменён: {value}", ephemeral=True)
+
+
+class RenameVoiceForm(discord.ui.Modal, title="Переименовать войс"):
+    name = discord.ui.TextInput(label="Новое название", required=True, max_length=100, placeholder="Например: Войс для игры")
+
+    def __init__(self, voice_id: int, user_id: int, closed: bool, control_message: discord.Message) -> None:
+        super().__init__()
+        self.voice_id = voice_id
+        self.user_id = user_id
+        self.closed = closed
+        self.control_message = control_message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        voice, _ = await voice_access(interaction, self.voice_id, self.user_id)
+        if not voice:
+            return
+        new_name = self.name.value.strip()
+        if not new_name:
+            await interaction.response.send_message("Название не может быть пустым", ephemeral=True)
+            return
+        await voice.edit(name=new_name, reason=f"Войс переименован {interaction.user}")
+        try:
+            await self.control_message.edit(view=VoiceControls(self.voice_id, self.user_id, self.closed))
+        except discord.HTTPException:
+            logging.exception("Не удалось обновить панель управления войсом %s", self.voice_id)
+        await interaction.response.send_message(f"Войс переименован: **{discord.utils.escape_markdown(new_name)}**", ephemeral=True)
 
 
 async def voice_access(interaction: discord.Interaction, voice_id: int, user_id: int) -> tuple[discord.VoiceChannel | None, tuple[discord.Role, discord.Role, discord.Role, discord.Role] | None]:
@@ -723,6 +754,38 @@ async def voice_access(interaction: discord.Interaction, voice_id: int, user_id:
     return voice, roles
 
 
+class KickMemberSelect(discord.ui.UserSelect):
+    def __init__(self, voice_id: int, owner_id: int) -> None:
+        super().__init__(placeholder="Выберите участника для исключения", min_values=1, max_values=1)
+        self.voice_id = voice_id
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        voice, _ = await voice_access(interaction, self.voice_id, self.owner_id)
+        if not voice:
+            return
+        selected = self.values[0]
+        member = selected if isinstance(selected, discord.Member) else interaction.guild.get_member(selected.id) if interaction.guild else None
+        if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel != voice:
+            await interaction.response.send_message("Этот участник уже не находится в войсе", ephemeral=True)
+            return
+        try:
+            await member.move_to(None, reason=f"Исключён из временного войса пользователем {interaction.user}")
+        except discord.Forbidden:
+            await interaction.response.send_message("Боту не хватает права перемещать участников", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message("Не удалось исключить участника. Попробуйте ещё раз", ephemeral=True)
+            return
+        await interaction.response.edit_message(content=f"{member.mention} исключён из войса", view=None)
+
+
+class KickMemberView(discord.ui.View):
+    def __init__(self, voice_id: int, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self.add_item(KickMemberSelect(voice_id, owner_id))
+
+
 class VoiceControls(discord.ui.View):
     def __init__(self, voice_id: int, user_id: int, closed: bool) -> None:
         super().__init__(timeout=None)
@@ -730,6 +793,8 @@ class VoiceControls(discord.ui.View):
         self.user_id = user_id
         self.closed = closed
         self.slots.custom_id = f"voice:slots:{voice_id}:{user_id}"
+        self.rename.custom_id = f"voice:rename:{voice_id}:{user_id}"
+        self.kick.custom_id = f"voice:kick:{voice_id}:{user_id}"
         self.lock.custom_id = f"voice:lock:{voice_id}:{user_id}"
         self.lock.label = "Войс закрыт" if closed else "Войс открыт"
         self.lock.style = discord.ButtonStyle.danger if closed else discord.ButtonStyle.success
@@ -738,7 +803,23 @@ class VoiceControls(discord.ui.View):
     async def slots(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         voice, roles = await voice_access(interaction, self.voice_id, self.user_id)
         if voice and roles:
-            await show_modal(interaction, SlotsForm(self.voice_id, self.user_id))
+            await show_modal(interaction, SlotsForm(self.voice_id, self.user_id, self.closed, interaction.message))
+
+    @discord.ui.button(label="Переименовать", style=discord.ButtonStyle.primary)
+    async def rename(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        voice, roles = await voice_access(interaction, self.voice_id, self.user_id)
+        if voice and roles:
+            await show_modal(interaction, RenameVoiceForm(self.voice_id, self.user_id, self.closed, interaction.message))
+
+    @discord.ui.button(label="Выгнать участника", style=discord.ButtonStyle.danger)
+    async def kick(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        voice, roles = await voice_access(interaction, self.voice_id, self.user_id)
+        if not voice or not roles:
+            return
+        if not voice.members:
+            await interaction.response.send_message("В этом войсе сейчас нет участников", ephemeral=True)
+            return
+        await interaction.response.send_message("Выберите участника, которого нужно исключить из войса", view=KickMemberView(self.voice_id, self.user_id), ephemeral=True)
 
     @discord.ui.button(label="Войс открыт", style=discord.ButtonStyle.success)
     async def lock(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -767,7 +848,7 @@ async def create_voice(member: discord.Member) -> None:
     }
     voice = await member.guild.create_voice_channel(f"Войс | {member.display_name}"[:100], category=category, overwrites=overwrites, reason=f"Временный войс для {member}")
     await member.move_to(voice, reason="Перемещение в созданный войс")
-    await voice.send(embed=discord.Embed(title="Управление войсом", description="Измените количество мест или закройте доступ. Управлять может создатель, хелпер или администратор", colour=colour(VOICE_CONTROL_COLOR_HTML)), view=VoiceControls(voice.id, member.id, False))
+    await voice.send(embed=discord.Embed(title="Управление войсом", description="Переименовывайте войс, меняйте лимит, закрывайте доступ и исключайте участников. Управлять может только создатель войса, хелпер или администратор", colour=colour(VOICE_CONTROL_COLOR_HTML)), view=VoiceControls(voice.id, member.id, False))
     bot.store.add_voice(voice.id, member.id)
 
 
