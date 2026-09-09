@@ -338,8 +338,16 @@ async def restore(guild: discord.Guild) -> None:
             if user_id:
                 bot.add_view(TicketControls(user_id))
     for voice_id, user_id, closed in bot.store.voices():
-        if isinstance(guild.get_channel(voice_id), discord.VoiceChannel):
+        voice = guild.get_channel(voice_id)
+        if isinstance(voice, discord.VoiceChannel):
             bot.add_view(VoiceControls(voice_id, user_id, closed))
+            try:
+                async for message in voice.history(limit=20):
+                    if message.author == bot.user and any(embed.title == "Управление войсом" for embed in message.embeds):
+                        await message.edit(embed=voice_control_embed(), view=VoiceControls(voice_id, user_id, closed))
+                        break
+            except discord.HTTPException:
+                logging.exception("Не удалось обновить панель управления войсом %s", voice_id)
         else:
             bot.store.remove_voice(voice_id)
 
@@ -836,6 +844,14 @@ class VoiceControls(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
 
+def voice_control_embed() -> discord.Embed:
+    return discord.Embed(
+        title="Управление войсом",
+        description="Переименовывайте войс, меняйте лимит, закрывайте доступ и исключайте участников. Управлять может только создатель войса, хелпер или администратор",
+        colour=colour(VOICE_CONTROL_COLOR_HTML),
+    )
+
+
 async def create_voice(member: discord.Member) -> None:
     roles = await bot.roles(member.guild)
     category = member.guild.get_channel(VOICE_CATEGORY_ID)
@@ -848,7 +864,7 @@ async def create_voice(member: discord.Member) -> None:
     }
     voice = await member.guild.create_voice_channel(f"Войс | {member.display_name}"[:100], category=category, overwrites=overwrites, reason=f"Временный войс для {member}")
     await member.move_to(voice, reason="Перемещение в созданный войс")
-    await voice.send(embed=discord.Embed(title="Управление войсом", description="Переименовывайте войс, меняйте лимит, закрывайте доступ и исключайте участников. Управлять может только создатель войса, хелпер или администратор", colour=colour(VOICE_CONTROL_COLOR_HTML)), view=VoiceControls(voice.id, member.id, False))
+    await voice.send(embed=voice_control_embed(), view=VoiceControls(voice.id, member.id, False))
     bot.store.add_voice(voice.id, member.id)
 
 
