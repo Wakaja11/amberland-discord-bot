@@ -128,15 +128,19 @@ async def application_nickname(channel: discord.TextChannel) -> str | None:
     nickname = bot.store.application_nickname(channel.id)
     if nickname:
         return nickname
+    details = await application_details(channel)
+    return details.get("Никнейм")
+
+
+async def application_details(channel: discord.TextChannel) -> dict[str, str]:
     try:
         async for message in channel.history(limit=25, oldest_first=True):
             for embed in message.embeds:
-                for field in embed.fields:
-                    if field.name == "Никнейм":
-                        return field.value
+                if embed.title == "Новая заявка":
+                    return {field.name: field.value for field in embed.fields}
     except discord.HTTPException:
         pass
-    return None
+    return {}
 
 
 def colour(html: str) -> discord.Colour:
@@ -154,22 +158,29 @@ class RconError(RuntimeError):
 
 def run_rcon_command(command: str) -> str:
     if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
+        logging.warning("RCON: команда не выполнена — подключение не настроено")
         raise RconError("RCON не настроен")
     try:
+        logging.info("RCON: подключение к серверу и отправка команды: %s", command)
         with MCRcon(
             RCON_HOST,
             RCON_PASSWORD,
             port=RCON_PORT,
             timeout=RCON_TIMEOUT_SECONDS,
         ) as client:
-            return str(client.command(command))
+            response = str(client.command(command))
+        logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
+        return response
     except MCRconException as error:
         if "Login failed" in str(error):
+            logging.warning("RCON: сервер отклонил пароль")
             raise RconError("RCON отклонил пароль") from error
+        logging.exception("RCON: ошибка библиотеки при выполнении команды")
         raise RconError("Не удалось выполнить команду RCON") from error
     except RconError:
         raise
     except Exception as error:
+        logging.exception("RCON: не удалось выполнить команду")
         raise RconError("Не удалось выполнить команду RCON") from error
 
 
@@ -472,24 +483,44 @@ class ApplicationDecision(discord.ui.View):
         if not nickname:
             await interaction.response.send_message("Не удалось найти никнейм из заявки", ephemeral=True)
             return
+        details = await application_details(interaction.channel)
+        details["Пользователь"] = applicant.mention
+        details.setdefault("Никнейм", nickname)
         await interaction.response.defer(ephemeral=True)
         if RCON_ENABLED:
+            command = WHITELIST_COMMAND.format(nickname=nickname)
             try:
-                await whitelist_player(nickname)
+                response = await whitelist_player(nickname)
             except RconError as error:
+                await bot.log(interaction.guild, "RCON • ошибка добавления в белый список", {
+                    "Никнейм": nickname,
+                    "Команда": command,
+                    "Ошибка": str(error),
+                }, avatar_url=str(applicant.display_avatar.url))
                 await interaction.followup.send(f"Не удалось добавить игрока в белый список: {error}", ephemeral=True)
                 return
+            await bot.log(interaction.guild, "RCON • игрок добавлен в белый список", {
+                "Никнейм": nickname,
+                "Команда": command,
+                "Ответ сервера": response or "Команда выполнена без текстового ответа",
+            }, avatar_url=str(applicant.display_avatar.url))
+        else:
+            await bot.log(interaction.guild, "RCON • добавление в белый список пропущено", {
+                "Никнейм": nickname,
+                "Причина": "RCON_ENABLED выключен",
+            }, avatar_url=str(applicant.display_avatar.url))
         await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
         await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
         await interaction.channel.edit(topic=f"{APP_PREFIX}{self.user_id};accepted", reason=f"Заявка одобрена {interaction.user}")
         if interaction.message:
             await interaction.message.edit(view=None)
-        await bot.log(interaction.guild, "Заявка принята", {
-            "Модератор": interaction.user.mention,
-            "Пользователь": applicant.mention,
-            "Никнейм": nickname,
-        }, avatar_url=str(applicant.display_avatar.url))
+        await bot.log(
+            interaction.guild,
+            "Заявка принята",
+            {"Модератор": interaction.user.mention, **details},
+            avatar_url=str(applicant.display_avatar.url),
+        )
         bot.store.remove_application(interaction.channel.id)
         await interaction.followup.send("Заявка принята: игрок выдан, гость снят", ephemeral=True)
         await asyncio.sleep(2)
