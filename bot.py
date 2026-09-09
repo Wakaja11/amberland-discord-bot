@@ -329,7 +329,7 @@ class GameRulesView(discord.ui.View):
         super().__init__(timeout=120)
         self.user_id = user_id
 
-    @discord.ui.button(label="Ознакомлен с правилами", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(label="Ознакомлен с правилами", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Эта кнопка доступна только автору заявки", ephemeral=True)
@@ -346,7 +346,7 @@ class ApplicationPanel(discord.ui.View):
         if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.get_role(PLAYER_ROLE_ID):
             await interaction.response.send_message("У вас уже есть роль игрока", ephemeral=True)
             return
-        embed = discord.Embed(title="Правила игры", description=GAME_RULES, colour=colour(APPLICATION_PANEL_COLOR_HTML))
+        embed = discord.Embed(title="Правила игры на сервере", description=GAME_RULES, colour=colour(APPLICATION_PANEL_COLOR_HTML))
         await interaction.response.send_message("Перед подачей заявки ознакомьтесь с правилами", embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
 
 
