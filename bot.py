@@ -836,6 +836,14 @@ class VoiceControls(discord.ui.View):
             return
         self.closed = not self.closed
         await voice.set_permissions(interaction.guild.default_role, connect=False if self.closed else None, reason=f"Войс изменён {interaction.user}")
+        owner_member = interaction.guild.get_member(self.user_id)
+        if owner_member is None:
+            try:
+                owner_member = await interaction.guild.fetch_member(self.user_id)
+            except discord.NotFound:
+                pass
+        if owner_member is not None:
+            await voice.set_permissions(owner_member, view_channel=True, connect=True, reason="Доступ создателю временного войса")
         await voice.set_permissions(roles[2], connect=True, view_channel=True)
         await voice.set_permissions(roles[3], connect=True, view_channel=True)
         bot.store.close_voice(self.voice_id, self.closed)
