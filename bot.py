@@ -283,6 +283,7 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
             return
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
@@ -397,7 +398,7 @@ FORMS = {
     "territory": ("Вопрос о территории", (("Ваш никнейм", True), ("Название территории или координаты", True), ("Ваш вопрос", True))),
     "donation": ("Проблема с донатом", (("Ваш никнейм", True), ("Что было приобретено?", True), ("Описание проблемы", True), ("Номер платежа (если есть)", False))),
     "admin": ("Жалоба на администратора", (("Ваш никнейм", True), ("Никнейм администратора", True), ("Что случилось?", True))),
-    "other": ("Другое", (("Ваш никнейм", True), ("Тема обращения", True), ("Опишите ситуацию", True))),
+    "other": ("Другое", (("Ваш никнейм", True), ("Опишите ситуацию", True))),
 }
 
 
@@ -406,8 +407,10 @@ class HelpForm(discord.ui.Modal):
         title, fields = FORMS[kind]
         super().__init__(title=title[:45])
         self.kind = kind
+        self.subject = discord.ui.TextInput(label="Тема обращения", required=True, max_length=100)
         self.inputs: list[discord.ui.TextInput] = []
         long = {"Описание бага", "Как повторить баг?", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите ситуацию"}
+        self.add_item(self.subject)
         for label, required in fields:
             item = discord.ui.TextInput(label=label, required=required, style=discord.TextStyle.paragraph if label in long else discord.TextStyle.short, max_length=1000)
             self.inputs.append(item)
@@ -435,9 +438,11 @@ class HelpForm(discord.ui.Modal):
         title, fields = FORMS[self.kind]
         embed = discord.Embed(title=title, colour=colour(TICKET_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Автор", value=interaction.user.mention, inline=False)
+        embed.add_field(name="Тема обращения", value=self.subject.value, inline=False)
         log_fields: dict[str, object] = {
             "Пользователь": interaction.user.mention,
             "Тип": title,
+            "Тема обращения": self.subject.value,
         }
         for (label, _), item in zip(fields, self.inputs):
             value = item.value or "Не указано"
@@ -484,6 +489,18 @@ def is_ticket(channel: object) -> bool:
     return isinstance(channel, discord.TextChannel) and channel.category_id == TICKET_CATEGORY_ID and owner(channel, TICKET_PREFIX) is not None
 
 
+async def ticket_subject(channel: discord.TextChannel) -> str:
+    try:
+        async for message in channel.history(limit=25, oldest_first=True):
+            for embed in message.embeds:
+                for field in embed.fields:
+                    if field.name == "Тема обращения":
+                        return field.value
+    except discord.HTTPException:
+        pass
+    return "Не указано"
+
+
 @bot.tree.command(name="add", description="Добавить пользователя в текущее обращение")
 @app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(user="Пользователь, которому нужно открыть доступ")
@@ -503,7 +520,7 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
     await bot.log(interaction.guild, "Пользователь добавлен в обращение", {
         "Модератор": interaction.user.mention,
         "Пользователь": user.mention,
-        "Обращение": interaction.channel.mention,
+        "Тема обращения": await ticket_subject(interaction.channel),
     })
     await interaction.response.send_message(f"{user.mention} добавлен в обращение", ephemeral=True)
 
