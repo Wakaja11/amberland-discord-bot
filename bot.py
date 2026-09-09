@@ -23,7 +23,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "")
 RCON_ENABLED = os.getenv("RCON_ENABLED", "0") == "1"
 RCON_HOST = os.getenv("RCON_HOST", "")
 RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
-RCON_PASSWORD = os.getenv("BOT_RCON_PASSWORD", os.getenv("RCON_PASSWORD", ""))
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 RCON_TIMEOUT_SECONDS = 10
 WHITELIST_COMMAND = "whitelist add {nickname}"
 
