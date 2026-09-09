@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from mctools import RCONClient
+from mcrcon import MCRcon, MCRconException
 
 
 # ============================================================
@@ -155,26 +155,26 @@ class RconError(RuntimeError):
 def run_rcon_command(command: str) -> str:
     if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
         raise RconError("RCON не настроен")
-    client: RCONClient | None = None
     try:
-        client = RCONClient(RCON_HOST, port=RCON_PORT, timeout=RCON_TIMEOUT_SECONDS)
-        if not client.login(RCON_PASSWORD):
-            raise RconError("RCON отклонил пароль")
-        return str(client.command(command))
+        with MCRcon(
+            RCON_HOST,
+            RCON_PASSWORD,
+            port=RCON_PORT,
+            timeout=RCON_TIMEOUT_SECONDS,
+        ) as client:
+            return str(client.command(command))
+    except MCRconException as error:
+        if "Login failed" in str(error):
+            raise RconError("RCON отклонил пароль") from error
+        raise RconError("Не удалось выполнить команду RCON") from error
     except RconError:
         raise
     except Exception as error:
         raise RconError("Не удалось выполнить команду RCON") from error
-    finally:
-        if client is not None:
-            try:
-                client.stop()
-            except Exception:
-                logging.debug("Не удалось корректно закрыть RCON-соединение", exc_info=True)
 
 
 async def rcon_command(command: str) -> str:
-    return await asyncio.to_thread(run_rcon_command, command)
+    return run_rcon_command(command)
 
 
 async def whitelist_player(nickname: str) -> str:
@@ -208,12 +208,20 @@ class Bot(commands.Bot):
             raise RuntimeError("Не найдены одна или несколько ролей из настроек.")
         return roles
 
-    async def log(self, guild: discord.Guild, action: str, fields: dict[str, object] | None = None) -> None:
+    async def log(
+        self,
+        guild: discord.Guild,
+        action: str,
+        fields: dict[str, object] | None = None,
+        avatar_url: str | None = None,
+    ) -> None:
         logging.info("%s | %s", action, fields or {})
         channel = guild.get_channel(LOG_CHANNEL_ID)
         if isinstance(channel, discord.TextChannel):
             try:
                 embed = discord.Embed(title=f"Лог • {action}", colour=colour(LOG_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+                if avatar_url:
+                    embed.set_thumbnail(url=avatar_url)
                 for name, value in (fields or {}).items():
                     text = str(value) or "Не указано"
                     parts = [text[index:index + 1024] for index in range(0, len(text), 1024)]
@@ -379,13 +387,6 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         ):
             embed.add_field(name=label, value=value, inline=inline)
         await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=ApplicationDecision(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-        await bot.log(interaction.guild, "Новая заявка", {
-            "Пользователь": f"{interaction.user.mention} ({interaction.user})",
-            "Никнейм": self.nickname.value,
-            "Возраст": self.age.value,
-            "Кратко о себе": self.about.value,
-            "Откуда узнали": self.source.value or "Не указано",
-        })
         await interaction.response.send_message("Заявка отправлена. Ожидайте решение в личных сообщениях", ephemeral=True)
 
 
@@ -429,6 +430,12 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
         applicant = interaction.guild.get_member(self.user_id)
         if applicant:
             await dm(applicant, discord.Embed(title="Заявка отклонена", description=f"Причина: {self.reason.value}\nОтклонил: {interaction.user.mention}", colour=colour(APPLICATION_REJECTED_COLOR_HTML)))
+        avatar_owner = applicant
+        if avatar_owner is None:
+            try:
+                avatar_owner = await bot.fetch_user(self.user_id)
+            except discord.HTTPException:
+                pass
         await interaction.channel.edit(topic=f"{APP_PREFIX}{self.user_id};rejected", reason=f"Заявка отклонена {interaction.user}")
         try:
             await (await interaction.channel.fetch_message(self.message_id)).edit(view=None)
@@ -438,7 +445,7 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
             "Модератор": interaction.user.mention,
             "Пользователь": f"<@{self.user_id}>",
             "Причина": self.reason.value,
-        })
+        }, avatar_url=str(avatar_owner.display_avatar.url) if avatar_owner else None)
         bot.store.remove_application(interaction.channel.id)
         await interaction.response.send_message("Заявка отклонена", ephemeral=True)
         await asyncio.sleep(2)
@@ -482,7 +489,7 @@ class ApplicationDecision(discord.ui.View):
             "Модератор": interaction.user.mention,
             "Пользователь": applicant.mention,
             "Никнейм": nickname,
-        })
+        }, avatar_url=str(applicant.display_avatar.url))
         bot.store.remove_application(interaction.channel.id)
         await interaction.followup.send("Заявка принята: игрок выдан, гость снят", ephemeral=True)
         await asyncio.sleep(2)
