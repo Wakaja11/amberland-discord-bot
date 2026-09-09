@@ -539,6 +539,7 @@ class TicketCloseForm(discord.ui.Modal, title="Закрытие обращени
         await delete_ticket(interaction.channel, "Обращение закрыто модератором", {
             "Модератор": interaction.user.mention,
             "Автор": f"<@{self.user_id}>",
+            "Тема обращения": await ticket_subject(interaction.channel),
             "Решение": self.solution.value,
         })
 
@@ -562,6 +563,7 @@ class TicketControls(discord.ui.View):
         await interaction.response.send_message("Спасибо! Обращение будет удалено через несколько секунд", ephemeral=True)
         await delete_ticket(interaction.channel, "Проблема решена игроком", {
             "Игрок": interaction.user.mention,
+            "Тема обращения": await ticket_subject(interaction.channel),
         })
 
     @discord.ui.button(label="Закрыть обращение", style=discord.ButtonStyle.primary)
