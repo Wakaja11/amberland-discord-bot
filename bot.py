@@ -332,7 +332,7 @@ class ApplicationPanel(discord.ui.View):
         if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.get_role(PLAYER_ROLE_ID):
             await interaction.response.send_message("У вас уже есть роль игрока", ephemeral=True)
             return
-        embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
+        embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с каналом <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
         await interaction.response.send_message(embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
 
 
