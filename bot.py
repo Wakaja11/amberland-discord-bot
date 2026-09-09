@@ -33,6 +33,7 @@ PLAYER_ROLE_ID = 1485642979556327445
 HELPER_ROLE_ID = 1486339038402183338
 ADMIN_ROLE_ID = 1486338979300380753
 GUILD_ID = 1484230925473546292
+RULES_CHANNEL_ID = 1485511848081227827
 
 APPLICATION_PANEL_COLOR_HTML = "#FFD700"
 APPLICATION_EMBED_COLOR_HTML = "#FFD700"
@@ -47,21 +48,6 @@ LOG_EMBED_COLOR_HTML = "#5865F2"
 DB_FILE = "bot_state.sqlite3"
 APP_PREFIX = "application_owner="
 TICKET_PREFIX = "ticket_owner="
-GAME_RULES = (
-    "**1.** Запрещён гриф в любом виде: кража вещей, разрушение территорий, убийство игроков и питомцев\n"
-    "**1.1.** Запрещены ловушки и механизмы, созданные для вреда игрокам\n"
-    "**1.2.** Запрещено портить игровой мир: недорубать деревья, строить столбы и блоки для прыжков\n"
-    "**1.3.** РП-PvP и соревновательное PvP проводятся по договорённости участников и фиксируются в игровой книге\n"
-    "**1.4.** Запрещено нападать на администратора при исполнении обязанностей\n\n"
-    "**2.** Запрещено использовать и хранить модификации, дающие преимущество в игре\n"
-    "**3.** Запрещено мешать проведению ивентов и работе спавна\n"
-    "**4.** Запрещено препятствовать работе администрации, делать ложные вызовы и вводить в заблуждение\n"
-    "**5.** Запрещены преследование и слежка за игроками\n"
-    "**6.** Запрещены лаг-машины и механизмы с большой нагрузкой на сервер\n"
-    "**7.** Запрещено вычислять, использовать и распространять сид мира\n"
-    "**8.** Запрещено использовать лазейки, багоюз и обходить наказания. О багах сообщайте в канал <#1495766775734865930>\n"
-    "**9.** Занятая территория обозначается пунктирной линией из неприродных блоков с табличками владельца"
-)
 
 
 # ============================================================
@@ -346,8 +332,8 @@ class ApplicationPanel(discord.ui.View):
         if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.get_role(PLAYER_ROLE_ID):
             await interaction.response.send_message("У вас уже есть роль игрока", ephemeral=True)
             return
-        embed = discord.Embed(title="Правила игры на сервере", description=GAME_RULES, colour=colour(APPLICATION_PANEL_COLOR_HTML))
-        await interaction.response.send_message("Перед подачей заявки ознакомьтесь с правилами", embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
+        embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
+        await interaction.response.send_message(embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
 
 
 class RejectionForm(discord.ui.Modal, title="Отклонение заявки"):
