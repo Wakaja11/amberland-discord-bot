@@ -5,13 +5,13 @@ import logging
 import os
 import re
 import sqlite3
-import struct
 from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from mctools import RCONClient
 
 
 # ============================================================
@@ -152,47 +152,29 @@ class RconError(RuntimeError):
     pass
 
 
-async def rcon_send(writer: asyncio.StreamWriter, request_id: int, packet_type: int, payload: str) -> None:
-    data = struct.pack("<ii", request_id, packet_type) + payload.encode("utf-8") + b"\x00\x00"
-    writer.write(struct.pack("<i", len(data)) + data)
-    await writer.drain()
-
-
-async def rcon_receive(reader: asyncio.StreamReader) -> tuple[int, int, str]:
-    length = struct.unpack("<i", await reader.readexactly(4))[0]
-    if length < 10 or length > 10_000_000:
-        raise RconError("Некорректный ответ RCON")
-    packet = await reader.readexactly(length)
-    request_id, packet_type = struct.unpack("<ii", packet[:8])
-    return request_id, packet_type, packet[8:-2].decode("utf-8", errors="replace")
+def run_rcon_command(command: str) -> str:
+    if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
+        raise RconError("RCON не настроен")
+    client: RCONClient | None = None
+    try:
+        client = RCONClient(RCON_HOST, port=RCON_PORT, timeout=RCON_TIMEOUT_SECONDS)
+        if not client.login(RCON_PASSWORD):
+            raise RconError("RCON отклонил пароль")
+        return str(client.command(command))
+    except RconError:
+        raise
+    except Exception as error:
+        raise RconError("Не удалось выполнить команду RCON") from error
+    finally:
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:
+                logging.debug("Не удалось корректно закрыть RCON-соединение", exc_info=True)
 
 
 async def rcon_command(command: str) -> str:
-    if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
-        raise RconError("RCON не настроен")
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=RCON_TIMEOUT_SECONDS)
-        try:
-            await rcon_send(writer, 1, 3, RCON_PASSWORD)
-            for _ in range(3):
-                request_id, packet_type, _ = await asyncio.wait_for(rcon_receive(reader), timeout=RCON_TIMEOUT_SECONDS)
-                if request_id == -1:
-                    raise RconError("RCON отклонил пароль")
-                if request_id == 1 and packet_type == 2:
-                    break
-            else:
-                raise RconError("RCON не подтвердил подключение")
-            await rcon_send(writer, 2, 2, command)
-            for _ in range(3):
-                request_id, _, response = await asyncio.wait_for(rcon_receive(reader), timeout=RCON_TIMEOUT_SECONDS)
-                if request_id == 2:
-                    return response
-            raise RconError("RCON не вернул ответ на команду")
-        finally:
-            writer.close()
-            await writer.wait_closed()
-    except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError) as error:
-        raise RconError("Не удалось подключиться к RCON") from error
+    return await asyncio.to_thread(run_rcon_command, command)
 
 
 async def whitelist_player(nickname: str) -> str:
