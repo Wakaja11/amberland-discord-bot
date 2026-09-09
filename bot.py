@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import struct
 from datetime import datetime, timezone
 
 import discord
@@ -19,6 +20,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
+RCON_ENABLED = os.getenv("RCON_ENABLED", "0") == "1"
+RCON_HOST = os.getenv("RCON_HOST", "")
+RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
+RCON_TIMEOUT_SECONDS = 10
+WHITELIST_COMMAND = "swl add {nickname}"
 
 APPLICATION_PANEL_CHANNEL_ID = 1486337529954304080
 HELP_PANEL_CHANNEL_ID = 1495766775734865930
@@ -62,6 +69,7 @@ class Store:
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "CREATE TABLE IF NOT EXISTS members (guild_id INTEGER, user_id INTEGER, PRIMARY KEY(guild_id,user_id));"
             "CREATE TABLE IF NOT EXISTS voices (voice_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, closed INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS applications (channel_id INTEGER PRIMARY KEY, nickname TEXT NOT NULL);"
         )
         self.db.commit()
 
@@ -77,6 +85,18 @@ class Store:
         cursor = self.db.execute("INSERT OR IGNORE INTO members VALUES(?,?)", (guild_id, user_id))
         self.db.commit()
         return cursor.rowcount == 1
+
+    def add_application(self, channel_id: int, nickname: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO applications VALUES(?,?)", (channel_id, nickname))
+        self.db.commit()
+
+    def application_nickname(self, channel_id: int) -> str | None:
+        row = self.db.execute("SELECT nickname FROM applications WHERE channel_id=?", (channel_id,)).fetchone()
+        return str(row[0]) if row else None
+
+    def remove_application(self, channel_id: int) -> None:
+        self.db.execute("DELETE FROM applications WHERE channel_id=?", (channel_id,))
+        self.db.commit()
 
     def add_voice(self, voice_id: int, owner_id: int) -> None:
         self.db.execute("INSERT OR REPLACE INTO voices VALUES(?,?,0)", (voice_id, owner_id))
@@ -104,6 +124,21 @@ def owner(channel: discord.abc.GuildChannel, prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+async def application_nickname(channel: discord.TextChannel) -> str | None:
+    nickname = bot.store.application_nickname(channel.id)
+    if nickname:
+        return nickname
+    try:
+        async for message in channel.history(limit=25, oldest_first=True):
+            for embed in message.embeds:
+                for field in embed.fields:
+                    if field.name == "Никнейм":
+                        return field.value
+    except discord.HTTPException:
+        pass
+    return None
+
+
 def colour(html: str) -> discord.Colour:
     return discord.Colour(int(html.removeprefix("#"), 16))
 
@@ -111,6 +146,59 @@ def colour(html: str) -> discord.Colour:
 def channel_name(prefix: str, member: discord.Member) -> str:
     name = re.sub(r"[^a-z0-9_-]", "", member.name.lower().replace(" ", "-"))
     return f"{prefix}-{name or member.id}"[:100]
+
+
+class RconError(RuntimeError):
+    pass
+
+
+async def rcon_send(writer: asyncio.StreamWriter, request_id: int, packet_type: int, payload: str) -> None:
+    data = struct.pack("<ii", request_id, packet_type) + payload.encode("utf-8") + b"\x00\x00"
+    writer.write(struct.pack("<i", len(data)) + data)
+    await writer.drain()
+
+
+async def rcon_receive(reader: asyncio.StreamReader) -> tuple[int, int, str]:
+    length = struct.unpack("<i", await reader.readexactly(4))[0]
+    if length < 10 or length > 10_000_000:
+        raise RconError("Некорректный ответ RCON")
+    packet = await reader.readexactly(length)
+    request_id, packet_type = struct.unpack("<ii", packet[:8])
+    return request_id, packet_type, packet[8:-2].decode("utf-8", errors="replace")
+
+
+async def rcon_command(command: str) -> str:
+    if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
+        raise RconError("RCON не настроен")
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=RCON_TIMEOUT_SECONDS)
+        try:
+            await rcon_send(writer, 1, 3, RCON_PASSWORD)
+            for _ in range(3):
+                request_id, packet_type, _ = await asyncio.wait_for(rcon_receive(reader), timeout=RCON_TIMEOUT_SECONDS)
+                if request_id == -1:
+                    raise RconError("RCON отклонил пароль")
+                if request_id == 1 and packet_type == 2:
+                    break
+            else:
+                raise RconError("RCON не подтвердил подключение")
+            await rcon_send(writer, 2, 2, command)
+            for _ in range(3):
+                request_id, _, response = await asyncio.wait_for(rcon_receive(reader), timeout=RCON_TIMEOUT_SECONDS)
+                if request_id == 2:
+                    return response
+            raise RconError("RCON не вернул ответ на команду")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError) as error:
+        raise RconError("Не удалось подключиться к RCON") from error
+
+
+async def whitelist_player(nickname: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", nickname):
+        raise RconError("Никнейм не соответствует формату Minecraft")
+    return await rcon_command(WHITELIST_COMMAND.format(nickname=nickname))
 
 
 class Bot(commands.Bot):
@@ -289,6 +377,7 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
         channel = await interaction.guild.create_text_channel(channel_name("заявка", interaction.user), category=category, overwrites=overwrites, topic=f"{APP_PREFIX}{interaction.user.id};pending", reason=f"Заявка от {interaction.user}")
+        bot.store.add_application(channel.id, self.nickname.value)
         embed = discord.Embed(title="Новая заявка", colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         for label, value, inline in (
@@ -360,6 +449,7 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
             "Пользователь": f"<@{self.user_id}>",
             "Причина": self.reason.value,
         })
+        bot.store.remove_application(interaction.channel.id)
         await interaction.response.send_message("Заявка отклонена", ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Заявка отклонена")
@@ -381,6 +471,17 @@ class ApplicationDecision(discord.ui.View):
         if not applicant:
             await interaction.response.send_message("Пользователь больше не находится на сервере", ephemeral=True)
             return
+        nickname = await application_nickname(interaction.channel)
+        if not nickname:
+            await interaction.response.send_message("Не удалось найти никнейм из заявки", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        if RCON_ENABLED:
+            try:
+                await whitelist_player(nickname)
+            except RconError as error:
+                await interaction.followup.send(f"Не удалось добавить игрока в белый список: {error}", ephemeral=True)
+                return
         await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
         await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
@@ -390,8 +491,10 @@ class ApplicationDecision(discord.ui.View):
         await bot.log(interaction.guild, "Заявка принята", {
             "Модератор": interaction.user.mention,
             "Пользователь": applicant.mention,
+            "Никнейм": nickname,
         })
-        await interaction.response.send_message("Заявка принята: игрок выдан, гость снят", ephemeral=True)
+        bot.store.remove_application(interaction.channel.id)
+        await interaction.followup.send("Заявка принята: игрок выдан, гость снят", ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Заявка принята")
 
