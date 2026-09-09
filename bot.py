@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 # НАСТРОЙКИ
 # ============================================================
 
-load_dotenv()
+load_dotenv(override=True)
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 RCON_ENABLED = os.getenv("RCON_ENABLED", "0") == "1"
 RCON_HOST = os.getenv("RCON_HOST", "")
