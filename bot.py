@@ -378,6 +378,17 @@ async def restore(guild: discord.Guild) -> None:
     for voice_id, user_id, closed in bot.store.voices():
         voice = guild.get_channel(voice_id)
         if isinstance(voice, discord.VoiceChannel):
+            try:
+                await voice.set_permissions(
+                    guild.default_role,
+                    view_channel=True,
+                    connect=not closed,
+                    send_messages=True,
+                    read_message_history=True,
+                    reason="Доступ к чату временного войса для всех пользователей",
+                )
+            except discord.HTTPException:
+                logging.exception("Не удалось обновить права чата временного войса %s", voice_id)
             bot.add_view(VoiceControls(voice_id, user_id, closed))
             try:
                 async for message in voice.history(limit=20):
@@ -1160,7 +1171,14 @@ class VoiceControls(discord.ui.View):
         if not voice or not roles:
             return
         self.closed = not self.closed
-        await voice.set_permissions(interaction.guild.default_role, connect=False if self.closed else None, reason=f"Войс изменён {interaction.user}")
+        await voice.set_permissions(
+            interaction.guild.default_role,
+            view_channel=True,
+            connect=not self.closed,
+            send_messages=True,
+            read_message_history=True,
+            reason=f"Войс изменён {interaction.user}",
+        )
         owner_member = interaction.guild.get_member(self.user_id)
         if owner_member is None:
             try:
@@ -1191,7 +1209,12 @@ async def create_voice(member: discord.Member) -> None:
     if not isinstance(category, discord.CategoryChannel):
         return
     overwrites = {
-        member.guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True),
+        member.guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            send_messages=True,
+            read_message_history=True,
+        ),
         roles[2]: discord.PermissionOverwrite(view_channel=True, connect=True),
         roles[3]: discord.PermissionOverwrite(view_channel=True, connect=True),
     }
