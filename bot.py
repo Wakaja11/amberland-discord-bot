@@ -396,22 +396,30 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
         if any(owner(channel, APP_PREFIX) == interaction.user.id and "pending" in (channel.topic or "") for channel in category.text_channels):
             await interaction.response.send_message("У вас уже есть активная заявка", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
-        if interaction.guild.me:
-            overwrites[interaction.guild.me] = discord.PermissionOverwrite(
+        if bot.user:
+            overwrites[discord.Object(id=bot.user.id)] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 read_message_history=True,
                 manage_channels=True,
                 manage_messages=True,
             )
-        channel = await interaction.guild.create_text_channel(channel_name("заявка", interaction.user), category=category, overwrites=overwrites, topic=f"{APP_PREFIX}{interaction.user.id};pending", reason=f"Заявка от {interaction.user}")
-        bot.store.add_application(channel.id, self.nickname.value)
+        try:
+            channel = await interaction.guild.create_text_channel(channel_name("заявка", interaction.user), category=category, overwrites=overwrites, topic=f"{APP_PREFIX}{interaction.user.id};pending", reason=f"Заявка от {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send("Боту не хватает прав для создания канала заявки в этой категории", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось создать канал заявки")
+            await interaction.followup.send("Не удалось создать канал заявки. Попробуйте ещё раз позже", ephemeral=True)
+            return
         embed = discord.Embed(title="Новая заявка", colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         for label, value, inline in (
@@ -422,8 +430,18 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
             ("Откуда узнали про нас?", self.source.value or "Не указано", False),
         ):
             embed.add_field(name=label, value=value, inline=inline)
-        await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=ApplicationDecision(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-        await interaction.response.send_message("Заявка отправлена. Ожидайте решение в личных сообщениях", ephemeral=True)
+        try:
+            await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=ApplicationDecision(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        except discord.HTTPException:
+            logging.exception("Не удалось отправить заявку в созданный канал")
+            try:
+                await channel.delete(reason="Не удалось отправить форму заявки")
+            except discord.HTTPException:
+                pass
+            await interaction.followup.send("Не удалось отправить форму заявки. Попробуйте ещё раз позже", ephemeral=True)
+            return
+        bot.store.add_application(channel.id, self.nickname.value)
+        await interaction.followup.send("Заявка отправлена. Ожидайте решение в личных сообщениях", ephemeral=True)
 
 
 class GameRulesView(discord.ui.View):
@@ -505,8 +523,8 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
         }
-        if interaction.guild.me:
-            overwrites[interaction.guild.me] = discord.PermissionOverwrite(
+        if bot.user:
+            overwrites[discord.Object(id=bot.user.id)] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
                 read_message_history=True,
@@ -530,12 +548,21 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             await interaction.followup.send("Не удалось создать канал заявки. Попробуйте ещё раз позже", ephemeral=True)
             return
         embed = event_application_embed(interaction.user, self.event_name.value, self.event_time.value, self.description.value)
-        await channel.send(
-            content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}",
-            embed=embed,
-            view=EventDecision(interaction.user.id),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-        )
+        try:
+            await channel.send(
+                content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}",
+                embed=embed,
+                view=EventDecision(interaction.user.id),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+        except discord.HTTPException:
+            logging.exception("Не удалось отправить заявку на ивент в созданный канал")
+            try:
+                await channel.delete(reason="Не удалось отправить форму заявки на ивент")
+            except discord.HTTPException:
+                pass
+            await interaction.followup.send("Не удалось отправить форму заявки на ивент. Попробуйте ещё раз позже", ephemeral=True)
+            return
         await interaction.followup.send(
             f"Заявка на ивент отправлена: {channel.mention}. При необходимости прикрепите фотографии отдельными сообщениями в этом канале",
             ephemeral=True,
@@ -632,11 +659,9 @@ class EventDecision(discord.ui.View):
             await interaction.response.send_message("Не найден канал или роль ивентов из настроек бота", ephemeral=True)
             return
         applicant = interaction.guild.get_member(self.user_id)
-        announcement = discord.Embed(title=name, description=description, colour=colour(APPLICATION_ACCEPTED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+        announcement = discord.Embed(title=name, description=description, colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         announcement.add_field(name="Дата и время", value=event_time, inline=False)
         announcement.add_field(name="Организатор", value=applicant.mention if applicant else f"<@{self.user_id}>", inline=False)
-        if applicant:
-            announcement.set_thumbnail(url=applicant.display_avatar.url)
         await interaction.response.defer(ephemeral=True)
         try:
             await events_channel.send(content=event_role.mention, embed=announcement, allowed_mentions=discord.AllowedMentions(roles=True))
