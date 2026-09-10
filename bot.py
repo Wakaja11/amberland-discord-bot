@@ -328,7 +328,7 @@ async def show_modal(interaction: discord.Interaction, modal: discord.ui.Modal) 
 
 async def panels(guild: discord.Guild) -> None:
     items = [
-        ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком или провести ивент? Выберите нужную кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
+        ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком? Нажмите кнопку ниже и заполните короткую заявку", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
         ("help", HELP_PANEL_CHANNEL_ID, discord.Embed(description="Нужна помощь? Нажмите кнопку, выберите тему обращения и опишите ситуацию", colour=colour(HELP_PANEL_COLOR_HTML)), HelpPanel()),
         ("spam", SPAM_PROTECTION_CHANNEL_ID, discord.Embed(description="Писать в этом канале **категорически запрещено**. Любое сообщение здесь приведёт к автоматической блокировке на сервере", colour=colour(SPAM_WARNING_COLOR_HTML)), None),
     ]
@@ -486,17 +486,6 @@ class ApplicationPanel(discord.ui.View):
         embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с каналом <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
         await interaction.response.send_message(embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
 
-    @discord.ui.button(label="Провести ивент", style=discord.ButtonStyle.primary, custom_id="event:open:v1")
-    async def event(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
-            return
-        if not interaction.user.get_role(PLAYER_ROLE_ID):
-            await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
-            return
-        await show_modal(interaction, EventForm())
-
-
 # ============================================================
 # ЗАЯВКИ НА ИВЕНТЫ
 # ============================================================
@@ -507,14 +496,14 @@ def event_application_embed(member: discord.abc.User, name: str, event_time: str
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Пользователь", value=member.mention, inline=False)
     embed.add_field(name="Название ивента", value=name, inline=False)
-    embed.add_field(name="Дата и время проведения", value=event_time, inline=False)
+    embed.add_field(name="Дата и время по МСК", value=event_time, inline=False)
     embed.add_field(name="Описание", value=description, inline=False)
     return embed
 
 
 class EventForm(discord.ui.Modal, title="Провести ивент"):
     event_name = discord.ui.TextInput(label="Название ивента", required=True, max_length=100)
-    event_time = discord.ui.TextInput(label="Дата и время проведения ивента", required=True, max_length=100, placeholder="Например: 15 сентября, 19:00 МСК")
+    event_time = discord.ui.TextInput(label="Дата и время по МСК", required=True, max_length=100, placeholder="Например: 15 сентября, 19:00 МСК")
     description = discord.ui.TextInput(label="Описание ивента", required=True, style=discord.TextStyle.paragraph, max_length=1000)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -623,7 +612,7 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
 
 class EventReworkForm(discord.ui.Modal, title="Доработка ивента"):
     event_name = discord.ui.TextInput(label="Название ивента", required=True, max_length=100)
-    event_time = discord.ui.TextInput(label="Дата и время проведения ивента", required=True, max_length=100)
+    event_time = discord.ui.TextInput(label="Дата и время по МСК", required=True, max_length=100)
     description = discord.ui.TextInput(label="Описание ивента", required=True, style=discord.TextStyle.paragraph, max_length=1000)
 
     def __init__(self, user_id: int, message_id: int, details: dict[str, str]) -> None:
@@ -631,7 +620,7 @@ class EventReworkForm(discord.ui.Modal, title="Доработка ивента")
         self.user_id = user_id
         self.message_id = message_id
         self.event_name.default = details.get("Название ивента", "")
-        self.event_time.default = details.get("Дата и время проведения", "")
+        self.event_time.default = details.get("Дата и время по МСК", details.get("Дата и время проведения", ""))
         self.description.default = details.get("Описание", "")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -664,7 +653,7 @@ class EventDecision(discord.ui.View):
             return
         details = await event_details(interaction.channel)
         name = details.get("Название ивента")
-        event_time = details.get("Дата и время проведения")
+        event_time = details.get("Дата и время по МСК") or details.get("Дата и время проведения")
         description = details.get("Описание")
         if not name or not event_time or not description:
             await interaction.response.send_message("Не удалось найти данные заявки на ивент", ephemeral=True)
@@ -715,7 +704,7 @@ class EventDecision(discord.ui.View):
             "Модератор": interaction.user.mention,
             "Пользователь": applicant.mention if applicant else f"<@{self.user_id}>",
             "Название ивента": name,
-            "Дата и время проведения": event_time,
+            "Дата и время по МСК": event_time,
             "Описание": description,
         }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
         result = "Ивент одобрен и опубликован в канале ивентов"
@@ -891,9 +880,20 @@ class HelpForm(discord.ui.Modal):
 
 class HelpSelect(discord.ui.Select):
     def __init__(self) -> None:
-        super().__init__(placeholder="Выберите тему обращения", custom_id="help:select", options=[discord.SelectOption(label=title, value=key) for key, (title, _) in FORMS.items()])
+        options = [discord.SelectOption(label=title, value=key) for key, (title, _) in FORMS.items()]
+        options.append(discord.SelectOption(label="Провести ивент", value="event"))
+        super().__init__(placeholder="Выберите тему обращения", custom_id="help:select", options=options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if self.values[0] == "event":
+            if not interaction.guild or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
+                return
+            if not interaction.user.get_role(PLAYER_ROLE_ID):
+                await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
+                return
+            await show_modal(interaction, EventForm())
+            return
         await show_modal(interaction, HelpForm(self.values[0]))
 
 
