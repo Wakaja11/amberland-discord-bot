@@ -44,11 +44,12 @@ RULES_CHANNEL_ID = 1485511848081227827
 EVENTS_CHANNEL_ID = 1485637955677716683
 EVENTS_ROLE_ID = 1520705428802109621
 
-APPLICATION_PANEL_COLOR_HTML = "#FFD700"
-APPLICATION_EMBED_COLOR_HTML = "#FFD700"
-HELP_PANEL_COLOR_HTML = "#FFD700"
-TICKET_EMBED_COLOR_HTML = "#FFD700"
-VOICE_CONTROL_COLOR_HTML = "#FFD700"
+GOLD_EMBED_COLOR_HTML = "#F1C40F"
+APPLICATION_PANEL_COLOR_HTML = GOLD_EMBED_COLOR_HTML
+APPLICATION_EMBED_COLOR_HTML = GOLD_EMBED_COLOR_HTML
+HELP_PANEL_COLOR_HTML = GOLD_EMBED_COLOR_HTML
+TICKET_EMBED_COLOR_HTML = GOLD_EMBED_COLOR_HTML
+VOICE_CONTROL_COLOR_HTML = GOLD_EMBED_COLOR_HTML
 SPAM_WARNING_COLOR_HTML = "#ED4245"
 APPLICATION_REJECTED_COLOR_HTML = "#ED4245"
 APPLICATION_ACCEPTED_COLOR_HTML = "#57F287"
@@ -155,6 +156,22 @@ async def event_details(channel: discord.TextChannel) -> dict[str, str]:
     except discord.HTTPException:
         pass
     return {}
+
+
+def is_image(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    return content_type.startswith("image/") or attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+
+async def event_photos(channel: discord.TextChannel, user_id: int) -> list[discord.Attachment]:
+    photos: list[discord.Attachment] = []
+    try:
+        async for message in channel.history(limit=1000, oldest_first=True):
+            if message.author.id == user_id:
+                photos.extend(attachment for attachment in message.attachments if is_image(attachment))
+    except discord.HTTPException:
+        logging.exception("Не удалось прочитать фотографии из заявки на ивент")
+    return photos
 
 
 def colour(html: str) -> discord.Colour:
@@ -659,18 +676,38 @@ class EventDecision(discord.ui.View):
             await interaction.response.send_message("Не найден канал или роль ивентов из настроек бота", ephemeral=True)
             return
         applicant = interaction.guild.get_member(self.user_id)
-        announcement = discord.Embed(title=name, description=description, colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
-        announcement.add_field(name="Дата и время", value=event_time, inline=False)
-        announcement.add_field(name="Организатор", value=applicant.mention if applicant else f"<@{self.user_id}>", inline=False)
+        organizer_name = applicant.display_name if applicant else str(self.user_id)
+        title_embed = discord.Embed(title=name, colour=colour(APPLICATION_EMBED_COLOR_HTML))
+        description_embed = discord.Embed(description=description, colour=colour(APPLICATION_EMBED_COLOR_HTML))
+        description_embed.set_footer(text=f"{event_time} • Организатор: {organizer_name}")
         await interaction.response.defer(ephemeral=True)
         try:
-            await events_channel.send(content=event_role.mention, embed=announcement, allowed_mentions=discord.AllowedMentions(roles=True))
+            await events_channel.send(content=event_role.mention, embed=title_embed, allowed_mentions=discord.AllowedMentions(roles=True))
         except discord.Forbidden:
             await interaction.followup.send("Боту не хватает прав для отправки сообщения в канал ивентов", ephemeral=True)
             return
         except discord.HTTPException:
             logging.exception("Не удалось опубликовать одобренный ивент")
             await interaction.followup.send("Не удалось опубликовать ивент. Попробуйте ещё раз", ephemeral=True)
+            return
+        skipped_photos = 0
+        for attachment in await event_photos(interaction.channel, self.user_id):
+            try:
+                photo_file = await attachment.to_file()
+                photo_embed = discord.Embed(colour=colour(APPLICATION_EMBED_COLOR_HTML))
+                photo_embed.set_image(url=f"attachment://{photo_file.filename}")
+                await events_channel.send(embed=photo_embed, file=photo_file)
+            except discord.HTTPException:
+                skipped_photos += 1
+                logging.exception("Не удалось опубликовать фотографию ивента")
+        try:
+            await events_channel.send(embed=description_embed)
+        except discord.Forbidden:
+            await interaction.followup.send("Боту не хватает прав для отправки описания ивента", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось опубликовать описание ивента")
+            await interaction.followup.send("Не удалось опубликовать описание ивента. Попробуйте ещё раз", ephemeral=True)
             return
         await interaction.channel.edit(topic=f"{EVENT_PREFIX}{self.user_id};accepted", reason=f"Ивент одобрен {interaction.user}")
         if interaction.message:
@@ -682,7 +719,10 @@ class EventDecision(discord.ui.View):
             "Дата и время проведения": event_time,
             "Описание": description,
         }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
-        await interaction.followup.send("Ивент одобрен и опубликован в канале ивентов", ephemeral=True)
+        result = "Ивент одобрен и опубликован в канале ивентов"
+        if skipped_photos:
+            result += f". Не удалось отправить фотографий: {skipped_photos}"
+        await interaction.followup.send(result, ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Ивент одобрен")
 
