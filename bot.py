@@ -369,6 +369,9 @@ async def restore(guild: discord.Guild) -> None:
     ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
     if isinstance(ticket_category, discord.CategoryChannel):
         for channel in ticket_category.text_channels:
+            event_user_id = owner(channel, EVENT_PREFIX)
+            if event_user_id and "pending" in (channel.topic or ""):
+                bot.add_view(EventDecision(event_user_id))
             user_id = owner(channel, TICKET_PREFIX)
             if user_id:
                 bot.add_view(TicketControls(user_id))
@@ -514,11 +517,19 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
             return
         roles = await bot.roles(interaction.guild)
-        category = interaction.guild.get_channel(APPLICATION_CATEGORY_ID)
+        category = interaction.guild.get_channel(TICKET_CATEGORY_ID)
         if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message("Категория заявок не найдена", ephemeral=True)
+            await interaction.response.send_message("Категория помощи не найдена", ephemeral=True)
             return
-        if any(owner(channel, EVENT_PREFIX) == interaction.user.id and "pending" in (channel.topic or "") for channel in category.text_channels):
+        application_category = interaction.guild.get_channel(APPLICATION_CATEGORY_ID)
+        event_categories = [category]
+        if isinstance(application_category, discord.CategoryChannel):
+            event_categories.append(application_category)
+        if any(
+            owner(channel, EVENT_PREFIX) == interaction.user.id and "pending" in (channel.topic or "")
+            for event_category in event_categories
+            for channel in event_category.text_channels
+        ):
             await interaction.response.send_message("У вас уже есть активная заявка на проведение ивента", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
