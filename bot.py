@@ -494,11 +494,6 @@ class ApplicationDecision(discord.ui.View):
             return
         await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
         await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
-        if applicant.nick != nickname:
-            try:
-                await applicant.edit(nick=nickname, reason=f"Заявка одобрена {interaction.user}")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
         await interaction.channel.edit(topic=f"{APP_PREFIX}{self.user_id};accepted", reason=f"Заявка одобрена {interaction.user}")
         if interaction.message:
