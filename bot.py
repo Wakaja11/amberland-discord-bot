@@ -41,6 +41,8 @@ HELPER_ROLE_ID = 1486339038402183338
 ADMIN_ROLE_ID = 1486338979300380753
 GUILD_ID = 1484230925473546292
 RULES_CHANNEL_ID = 1485511848081227827
+EVENTS_CHANNEL_ID = 1485637955677716683
+EVENTS_ROLE_ID = 1520705428802109621
 
 APPLICATION_PANEL_COLOR_HTML = "#FFD700"
 APPLICATION_EMBED_COLOR_HTML = "#FFD700"
@@ -54,6 +56,7 @@ LOG_EMBED_COLOR_HTML = "#5865F2"
 
 DB_FILE = "bot_state.sqlite3"
 APP_PREFIX = "application_owner="
+EVENT_PREFIX = "event_owner="
 TICKET_PREFIX = "ticket_owner="
 
 
@@ -137,6 +140,17 @@ async def application_details(channel: discord.TextChannel) -> dict[str, str]:
         async for message in channel.history(limit=25, oldest_first=True):
             for embed in message.embeds:
                 if embed.title == "Новая заявка":
+                    return {field.name: field.value for field in embed.fields}
+    except discord.HTTPException:
+        pass
+    return {}
+
+
+async def event_details(channel: discord.TextChannel) -> dict[str, str]:
+    try:
+        async for message in channel.history(limit=1000, oldest_first=True):
+            for embed in message.embeds:
+                if embed.title == "Заявка на проведение ивента":
                     return {field.name: field.value for field in embed.fields}
     except discord.HTTPException:
         pass
@@ -297,7 +311,7 @@ async def show_modal(interaction: discord.Interaction, modal: discord.ui.Modal) 
 
 async def panels(guild: discord.Guild) -> None:
     items = [
-        ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком? Нажмите кнопку ниже и заполните короткую заявку", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
+        ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком или провести ивент? Выберите нужную кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
         ("help", HELP_PANEL_CHANNEL_ID, discord.Embed(description="Нужна помощь? Нажмите кнопку, выберите тему обращения и опишите ситуацию", colour=colour(HELP_PANEL_COLOR_HTML)), HelpPanel()),
         ("spam", SPAM_PROTECTION_CHANNEL_ID, discord.Embed(description="Писать в этом канале **категорически запрещено**. Любое сообщение здесь приведёт к автоматической блокировке на сервере", colour=colour(SPAM_WARNING_COLOR_HTML)), None),
     ]
@@ -332,6 +346,9 @@ async def restore(guild: discord.Guild) -> None:
             user_id = owner(channel, APP_PREFIX)
             if user_id and "pending" in (channel.topic or ""):
                 bot.add_view(ApplicationDecision(user_id))
+            event_user_id = owner(channel, EVENT_PREFIX)
+            if event_user_id and "pending" in (channel.topic or ""):
+                bot.add_view(EventDecision(event_user_id))
     ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
     if isinstance(ticket_category, discord.CategoryChannel):
         for channel in ticket_category.text_channels:
@@ -425,6 +442,210 @@ class ApplicationPanel(discord.ui.View):
             return
         embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с каналом <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
         await interaction.response.send_message(embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Провести ивент", style=discord.ButtonStyle.success, custom_id="event:open:v1")
+    async def event(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await show_modal(interaction, EventForm())
+
+
+# ============================================================
+# ЗАЯВКИ НА ИВЕНТЫ
+# ============================================================
+
+
+def event_application_embed(member: discord.abc.User, name: str, event_time: str, description: str) -> discord.Embed:
+    embed = discord.Embed(title="Заявка на проведение ивента", colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Пользователь", value=member.mention, inline=False)
+    embed.add_field(name="Название ивента", value=name, inline=False)
+    embed.add_field(name="Дата и время проведения", value=event_time, inline=False)
+    embed.add_field(name="Описание", value=description, inline=False)
+    embed.set_footer(text="Фотографии можно прикрепить отдельными сообщениями в этом канале.")
+    return embed
+
+
+class EventForm(discord.ui.Modal, title="Провести ивент"):
+    event_name = discord.ui.TextInput(label="Название ивента", required=True, max_length=100)
+    event_time = discord.ui.TextInput(label="Дата и время проведения ивента", required=True, max_length=100, placeholder="Например: 15 сентября, 19:00 МСК")
+    description = discord.ui.TextInput(label="Описание ивента", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
+            return
+        roles = await bot.roles(interaction.guild)
+        category = interaction.guild.get_channel(APPLICATION_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("Категория заявок не найдена", ephemeral=True)
+            return
+        if any(owner(channel, EVENT_PREFIX) == interaction.user.id and "pending" in (channel.topic or "") for channel in category.text_channels):
+            await interaction.response.send_message("У вас уже есть активная заявка на проведение ивента", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
+            roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
+        }
+        try:
+            channel = await interaction.guild.create_text_channel(
+                channel_name("ивент", interaction.user),
+                category=category,
+                overwrites=overwrites,
+                topic=f"{EVENT_PREFIX}{interaction.user.id};pending",
+                reason=f"Заявка на ивент от {interaction.user}",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send("Боту не хватает прав для создания канала заявки в этой категории", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось создать канал заявки на ивент")
+            await interaction.followup.send("Не удалось создать канал заявки. Попробуйте ещё раз позже", ephemeral=True)
+            return
+        embed = event_application_embed(interaction.user, self.event_name.value, self.event_time.value, self.description.value)
+        await channel.send(
+            content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}",
+            embed=embed,
+            view=EventDecision(interaction.user.id),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+        await interaction.followup.send(
+            f"Заявка на ивент отправлена: {channel.mention}. При необходимости прикрепите фотографии отдельными сообщениями в этом канале",
+            ephemeral=True,
+        )
+
+
+class EventRejectionForm(discord.ui.Modal, title="Отклонение заявки на ивент"):
+    reason = discord.ui.TextInput(label="Причина отказа", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+
+    def __init__(self, user_id: int, message_id: int) -> None:
+        super().__init__()
+        self.user_id = user_id
+        self.message_id = message_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        applicant = interaction.guild.get_member(self.user_id)
+        if applicant:
+            await dm(
+                applicant,
+                discord.Embed(
+                    title="Заявка на ивент отклонена",
+                    description=f"Причина: {self.reason.value}\nОтклонил: {interaction.user.mention}",
+                    colour=colour(APPLICATION_REJECTED_COLOR_HTML),
+                ),
+            )
+        await interaction.channel.edit(topic=f"{EVENT_PREFIX}{self.user_id};rejected", reason=f"Заявка на ивент отклонена {interaction.user}")
+        try:
+            await (await interaction.channel.fetch_message(self.message_id)).edit(view=None)
+        except discord.NotFound:
+            pass
+        await bot.log(interaction.guild, "Заявка на ивент отклонена", {
+            "Модератор": interaction.user.mention,
+            "Пользователь": f"<@{self.user_id}>",
+            "Причина": self.reason.value,
+        }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
+        await interaction.response.send_message("Заявка на ивент отклонена", ephemeral=True)
+        await asyncio.sleep(2)
+        await interaction.channel.delete(reason="Заявка на ивент отклонена")
+
+
+class EventReworkForm(discord.ui.Modal, title="Доработка ивента"):
+    event_name = discord.ui.TextInput(label="Название ивента", required=True, max_length=100)
+    event_time = discord.ui.TextInput(label="Дата и время проведения ивента", required=True, max_length=100)
+    description = discord.ui.TextInput(label="Описание ивента", required=True, style=discord.TextStyle.paragraph, max_length=1000)
+
+    def __init__(self, user_id: int, message_id: int, details: dict[str, str]) -> None:
+        super().__init__()
+        self.user_id = user_id
+        self.message_id = message_id
+        self.event_name.default = details.get("Название ивента", "")
+        self.event_time.default = details.get("Дата и время проведения", "")
+        self.description.default = details.get("Описание", "")
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await staff(interaction) or not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        applicant = interaction.guild.get_member(self.user_id)
+        if applicant is None:
+            await interaction.response.send_message("Пользователь больше не находится на сервере", ephemeral=True)
+            return
+        try:
+            message = await interaction.channel.fetch_message(self.message_id)
+        except discord.NotFound:
+            await interaction.response.send_message("Сообщение с заявкой не найдено", ephemeral=True)
+            return
+        await message.edit(embed=event_application_embed(applicant, self.event_name.value, self.event_time.value, self.description.value))
+        await interaction.response.send_message("Данные заявки обновлены", ephemeral=True)
+
+
+class EventDecision(discord.ui.View):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.accept.custom_id = f"event:accept:{user_id}"
+        self.rework.custom_id = f"event:rework:{user_id}"
+        self.reject.custom_id = f"event:reject:{user_id}"
+
+    @discord.ui.button(label="Одобрить", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await staff(interaction) or not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        details = await event_details(interaction.channel)
+        name = details.get("Название ивента")
+        event_time = details.get("Дата и время проведения")
+        description = details.get("Описание")
+        if not name or not event_time or not description:
+            await interaction.response.send_message("Не удалось найти данные заявки на ивент", ephemeral=True)
+            return
+        events_channel = interaction.guild.get_channel(EVENTS_CHANNEL_ID)
+        event_role = interaction.guild.get_role(EVENTS_ROLE_ID)
+        if not isinstance(events_channel, discord.TextChannel) or event_role is None:
+            await interaction.response.send_message("Не найден канал или роль ивентов из настроек бота", ephemeral=True)
+            return
+        applicant = interaction.guild.get_member(self.user_id)
+        announcement = discord.Embed(title=name, description=description, colour=colour(APPLICATION_ACCEPTED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+        announcement.add_field(name="Дата и время", value=event_time, inline=False)
+        announcement.add_field(name="Организатор", value=applicant.mention if applicant else f"<@{self.user_id}>", inline=False)
+        if applicant:
+            announcement.set_thumbnail(url=applicant.display_avatar.url)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await events_channel.send(content=event_role.mention, embed=announcement, allowed_mentions=discord.AllowedMentions(roles=True))
+        except discord.Forbidden:
+            await interaction.followup.send("Боту не хватает прав для отправки сообщения в канал ивентов", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось опубликовать одобренный ивент")
+            await interaction.followup.send("Не удалось опубликовать ивент. Попробуйте ещё раз", ephemeral=True)
+            return
+        await interaction.channel.edit(topic=f"{EVENT_PREFIX}{self.user_id};accepted", reason=f"Ивент одобрен {interaction.user}")
+        if interaction.message:
+            await interaction.message.edit(view=None)
+        await bot.log(interaction.guild, "Ивент одобрен", {
+            "Модератор": interaction.user.mention,
+            "Пользователь": applicant.mention if applicant else f"<@{self.user_id}>",
+            "Название ивента": name,
+            "Дата и время проведения": event_time,
+            "Описание": description,
+        }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
+        await interaction.followup.send("Ивент одобрен и опубликован в канале ивентов", ephemeral=True)
+        await asyncio.sleep(2)
+        await interaction.channel.delete(reason="Ивент одобрен")
+
+    @discord.ui.button(label="Доработать", style=discord.ButtonStyle.primary)
+    async def rework(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await staff(interaction) or not isinstance(interaction.channel, discord.TextChannel) or not interaction.message:
+            return
+        details = await event_details(interaction.channel)
+        await show_modal(interaction, EventReworkForm(self.user_id, interaction.message.id, details))
+
+    @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if await staff(interaction) and interaction.message:
+            await show_modal(interaction, EventRejectionForm(self.user_id, interaction.message.id))
 
 
 class RejectionForm(discord.ui.Modal, title="Отклонение заявки"):
