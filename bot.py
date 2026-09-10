@@ -494,17 +494,11 @@ class ApplicationDecision(discord.ui.View):
             return
         await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
         await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
-        discord_name_status = "уже совпадает с никнеймом Minecraft"
         if applicant.nick != nickname:
             try:
                 await applicant.edit(nick=nickname, reason=f"Заявка одобрена {interaction.user}")
-                discord_name_status = "изменено"
-            except discord.Forbidden:
-                discord_name_status = "не изменено: у бота недостаточно прав"
-                logging.warning("Не удалось изменить имя Discord пользователя %s: недостаточно прав", applicant.id)
-            except discord.HTTPException:
-                discord_name_status = "не изменено: ошибка Discord"
-                logging.exception("Не удалось изменить имя Discord пользователя %s", applicant.id)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
         await interaction.channel.edit(topic=f"{APP_PREFIX}{self.user_id};accepted", reason=f"Заявка одобрена {interaction.user}")
         if interaction.message:
@@ -512,7 +506,7 @@ class ApplicationDecision(discord.ui.View):
         await bot.log(
             interaction.guild,
             "Заявка принята",
-            {"Модератор": interaction.user.mention, **details, "Имя в Discord": discord_name_status},
+            {"Модератор": interaction.user.mention, **details},
             avatar_url=str(applicant.display_avatar.url),
         )
         bot.store.remove_application(interaction.channel.id)
@@ -955,7 +949,7 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
         bot.store.remove_voice(channel.id)
 
 
-@bot.tree.command(name="setup", description="Проверить панели бота")
+@bot.tree.command(name="установка", description="Проверить панели бота")
 @app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(administrator=True)
 async def setup(interaction: discord.Interaction) -> None:
