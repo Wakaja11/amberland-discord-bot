@@ -458,7 +458,7 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
             await interaction.followup.send("Не удалось отправить форму заявки. Попробуйте ещё раз позже", ephemeral=True)
             return
         bot.store.add_application(channel.id, self.nickname.value)
-        await interaction.followup.send("Заявка отправлена. Ожидайте решение в личных сообщениях", ephemeral=True)
+        await interaction.followup.send(f"Заявка отправлена: {channel.mention}. Ожидайте решение в личных сообщениях", ephemeral=True)
 
 
 class GameRulesView(discord.ui.View):
@@ -509,7 +509,6 @@ def event_application_embed(member: discord.abc.User, name: str, event_time: str
     embed.add_field(name="Название ивента", value=name, inline=False)
     embed.add_field(name="Дата и время проведения", value=event_time, inline=False)
     embed.add_field(name="Описание", value=description, inline=False)
-    embed.set_footer(text="Фотографии можно прикрепить отдельными сообщениями в этом канале.")
     return embed
 
 
@@ -581,7 +580,7 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             await interaction.followup.send("Не удалось отправить форму заявки на ивент. Попробуйте ещё раз позже", ephemeral=True)
             return
         await interaction.followup.send(
-            f"Заявка на ивент отправлена: {channel.mention}. При необходимости прикрепите фотографии отдельными сообщениями в этом канале",
+            f"Заявка на ивент отправлена: {channel.mention}. Чтобы прикрепить фотографии, отправьте изображения в канал с заявкой",
             ephemeral=True,
         )
 
@@ -679,7 +678,7 @@ class EventDecision(discord.ui.View):
         organizer_name = applicant.display_name if applicant else str(self.user_id)
         title_embed = discord.Embed(title=name, colour=colour(APPLICATION_EMBED_COLOR_HTML))
         description_embed = discord.Embed(description=description, colour=colour(APPLICATION_EMBED_COLOR_HTML))
-        description_embed.set_footer(text=f"{event_time} • Организатор: {organizer_name}")
+        description_embed.set_footer(text=f"{event_time} • {organizer_name}")
         await interaction.response.defer(ephemeral=True)
         try:
             await events_channel.send(content=event_role.mention, embed=title_embed, allowed_mentions=discord.AllowedMentions(roles=True))
