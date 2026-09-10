@@ -445,6 +445,12 @@ class ApplicationPanel(discord.ui.View):
 
     @discord.ui.button(label="Провести ивент", style=discord.ButtonStyle.success, custom_id="event:open:v1")
     async def event(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
+            return
+        if not interaction.user.get_role(PLAYER_ROLE_ID):
+            await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
+            return
         await show_modal(interaction, EventForm())
 
 
@@ -472,6 +478,9 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
+            return
+        if not interaction.user.get_role(PLAYER_ROLE_ID):
+            await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
             return
         roles = await bot.roles(interaction.guild)
         category = interaction.guild.get_channel(APPLICATION_CATEGORY_ID)
