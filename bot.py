@@ -402,6 +402,14 @@ class ApplicationForm(discord.ui.Modal, title="Заявка игрока"):
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
+        if interaction.guild.me:
+            overwrites[interaction.guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
         channel = await interaction.guild.create_text_channel(channel_name("заявка", interaction.user), category=category, overwrites=overwrites, topic=f"{APP_PREFIX}{interaction.user.id};pending", reason=f"Заявка от {interaction.user}")
         bot.store.add_application(channel.id, self.nickname.value)
         embed = discord.Embed(title="Новая заявка", colour=colour(APPLICATION_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
@@ -443,7 +451,7 @@ class ApplicationPanel(discord.ui.View):
         embed = discord.Embed(title="Правила игры на сервере", description=f"После ознакомления с каналом <#{RULES_CHANNEL_ID}> нажмите кнопку ниже", colour=colour(APPLICATION_PANEL_COLOR_HTML))
         await interaction.response.send_message(embed=embed, view=GameRulesView(interaction.user.id), ephemeral=True)
 
-    @discord.ui.button(label="Провести ивент", style=discord.ButtonStyle.success, custom_id="event:open:v1")
+    @discord.ui.button(label="Провести ивент", style=discord.ButtonStyle.primary, custom_id="event:open:v1")
     async def event(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Заявку на ивент можно подать только на сервере", ephemeral=True)
@@ -497,6 +505,15 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
         }
+        if interaction.guild.me:
+            overwrites[interaction.guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
         try:
             channel = await interaction.guild.create_text_channel(
                 channel_name("ивент", interaction.user),
