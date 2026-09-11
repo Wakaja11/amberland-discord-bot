@@ -887,16 +887,10 @@ class HelpForm(discord.ui.Modal):
         title, fields = FORMS[self.kind]
         embed = discord.Embed(title=title, colour=colour(TICKET_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Автор", value=interaction.user.mention, inline=False)
-        log_fields: dict[str, object] = {
-            "Пользователь": interaction.user.mention,
-            "Тема обращения": title,
-        }
         for (label, _), item in zip(fields, self.inputs):
             value = item.value or "Не указано"
             embed.add_field(name=label, value=value, inline=False)
-            log_fields[label] = value
         await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=TicketControls(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-        await bot.log(interaction.guild, "Новое обращение", log_fields)
         await interaction.response.send_message(f"Обращение создано: {channel.mention}", ephemeral=True)
 
 
@@ -1241,14 +1235,6 @@ async def on_member_join(member: discord.Member) -> None:
     if bot.store.first_join(member.guild.id, member.id):
         guest, _, _, _ = await bot.roles(member.guild)
         await member.add_roles(guest, reason="Первый вход на сервер")
-        await bot.log(member.guild, "Первый вход пользователя", {
-            "Пользователь": f"{member.mention} ({member})",
-            "Выданная роль": guest.mention,
-        })
-    else:
-        await bot.log(member.guild, "Повторный вход пользователя", {
-            "Пользователь": f"{member.mention} ({member})",
-        })
 
 
 @bot.event
