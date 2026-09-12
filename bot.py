@@ -374,17 +374,19 @@ async def restore(guild: discord.Guild) -> None:
                 bot.add_view(EventDecision(event_user_id))
             user_id = owner(channel, TICKET_PREFIX)
             if user_id:
-                user_overwrite = channel.overwrites_for(discord.Object(id=user_id))
-                if user_overwrite.attach_files is not True:
-                    user_overwrite.attach_files = True
-                    try:
-                        await channel.set_permissions(
-                            discord.Object(id=user_id),
-                            overwrite=user_overwrite,
-                            reason="Разрешение прикреплять файлы автору обращения",
-                        )
-                    except discord.HTTPException:
-                        logging.exception("Не удалось обновить права автора обращения %s", channel.id)
+                ticket_owner = guild.get_member(user_id)
+                if ticket_owner:
+                    user_overwrite = channel.overwrites_for(ticket_owner)
+                    if user_overwrite.attach_files is not True:
+                        user_overwrite.attach_files = True
+                        try:
+                            await channel.set_permissions(
+                                ticket_owner,
+                                overwrite=user_overwrite,
+                                reason="Разрешение прикреплять файлы автору обращения",
+                            )
+                        except discord.HTTPException:
+                            logging.exception("Не удалось обновить права автора обращения %s", channel.id)
                 bot.add_view(TicketControls(user_id))
     for voice_id, user_id, closed in bot.store.voices():
         voice = guild.get_channel(voice_id)
