@@ -608,6 +608,7 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
         if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
             return
         applicant = interaction.guild.get_member(self.user_id)
+        details = await event_details(interaction.channel)
         if applicant:
             await dm(
                 applicant,
@@ -622,11 +623,15 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
             await (await interaction.channel.fetch_message(self.message_id)).edit(view=None)
         except discord.NotFound:
             pass
-        await bot.log(interaction.guild, "Заявка на ивент отклонена", {
+        log_fields: dict[str, object] = {
             "Модератор": interaction.user.mention,
-            "Пользователь": f"<@{self.user_id}>",
-            "Причина": self.reason.value,
-        }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
+            "Пользователь": details.get("Пользователь", f"<@{self.user_id}>"),
+        }
+        log_fields.update({name: value for name, value in details.items() if name != "Пользователь"})
+        log_fields["Причина"] = self.reason.value
+        await bot.log(interaction.guild, "Заявка на ивент отклонена", log_fields,
+            avatar_url=str(applicant.display_avatar.url) if applicant else None,
+        )
         await interaction.response.send_message("Заявка на ивент отклонена", ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Заявка на ивент отклонена")
@@ -761,6 +766,7 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
         if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
             return
         applicant = interaction.guild.get_member(self.user_id)
+        details = await application_details(interaction.channel)
         if applicant:
             await dm(applicant, discord.Embed(title="Заявка отклонена", description=f"Причина: {self.reason.value}\nОтклонил: {interaction.user.mention}", colour=colour(APPLICATION_REJECTED_COLOR_HTML)))
         avatar_owner = applicant
@@ -774,11 +780,15 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
             await (await interaction.channel.fetch_message(self.message_id)).edit(view=None)
         except discord.NotFound:
             pass
-        await bot.log(interaction.guild, "Заявка отклонена", {
+        log_fields: dict[str, object] = {
             "Модератор": interaction.user.mention,
-            "Пользователь": f"<@{self.user_id}>",
-            "Причина": self.reason.value,
-        }, avatar_url=str(avatar_owner.display_avatar.url) if avatar_owner else None)
+            "Пользователь": details.get("Пользователь", f"<@{self.user_id}>"),
+        }
+        log_fields.update({name: value for name, value in details.items() if name != "Пользователь"})
+        log_fields["Причина"] = self.reason.value
+        await bot.log(interaction.guild, "Заявка отклонена", log_fields,
+            avatar_url=str(avatar_owner.display_avatar.url) if avatar_owner else None,
+        )
         bot.store.remove_application(interaction.channel.id)
         await interaction.response.send_message("Заявка отклонена", ephemeral=True)
         await asyncio.sleep(2)
