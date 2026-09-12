@@ -374,6 +374,17 @@ async def restore(guild: discord.Guild) -> None:
                 bot.add_view(EventDecision(event_user_id))
             user_id = owner(channel, TICKET_PREFIX)
             if user_id:
+                user_overwrite = channel.overwrites_for(discord.Object(id=user_id))
+                if user_overwrite.attach_files is not True:
+                    user_overwrite.attach_files = True
+                    try:
+                        await channel.set_permissions(
+                            discord.Object(id=user_id),
+                            overwrite=user_overwrite,
+                            reason="Разрешение прикреплять файлы автору обращения",
+                        )
+                    except discord.HTTPException:
+                        logging.exception("Не удалось обновить права автора обращения %s", channel.id)
                 bot.add_view(TicketControls(user_id))
     for voice_id, user_id, closed in bot.store.voices():
         voice = guild.get_channel(voice_id)
@@ -889,7 +900,12 @@ class HelpForm(discord.ui.Modal):
             return
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+            ),
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
         }
