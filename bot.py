@@ -868,6 +868,7 @@ class ApplicationDecision(discord.ui.View):
 FORMS = {
     "bug": ("Баг-репорт", (("Ваш никнейм", True), ("Описание бага", True), ("Как повторить баг?", True))),
     "login": ("Проблема со входом", (("Ваш никнейм", True), ("Что именно не работает?", True), ("Когда возникла проблема?", False))),
+    "game": ("Проблема с игрой", (("Ваш никнейм", True), ("Версия игры", True), ("Опишите проблему", True), ("Как повторить проблему?", False))),
     "player": ("Жалоба на игрока", (("Ваш никнейм", True), ("Никнейм нарушителя", True), ("Что случилось?", True))),
     "territory": ("Вопрос о территории", (("Ваш никнейм", True), ("Название территории или координаты", True), ("Ваш вопрос", True))),
     "donation": ("Проблема с донатом", (("Ваш никнейм", True), ("Что было приобретено?", True), ("Описание проблемы", True), ("Номер платежа (если есть)", False))),
@@ -882,7 +883,7 @@ class HelpForm(discord.ui.Modal):
         super().__init__(title=title[:45])
         self.kind = kind
         self.inputs: list[discord.ui.TextInput] = []
-        long = {"Описание бага", "Как повторить баг?", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите ситуацию"}
+        long = {"Описание бага", "Как повторить баг?", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите проблему", "Как повторить проблему?", "Опишите ситуацию"}
         for label, required in fields:
             item = discord.ui.TextInput(label=label, required=required, style=discord.TextStyle.paragraph if label in long else discord.TextStyle.short, max_length=1000)
             self.inputs.append(item)
