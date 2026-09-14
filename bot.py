@@ -1038,6 +1038,7 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
         view_channel=True,
         send_messages=True,
         read_message_history=True,
+        attach_files=True,
         reason=f"Добавлен в обращение {interaction.user}",
     )
     await interaction.followup.send(
