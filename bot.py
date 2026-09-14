@@ -59,6 +59,17 @@ DB_FILE = "bot_state.sqlite3"
 APP_PREFIX = "application_owner="
 EVENT_PREFIX = "event_owner="
 TICKET_PREFIX = "ticket_owner="
+TICKET_CHANNEL_PREFIXES = {
+    "bug": "баг",
+    "login": "вход",
+    "game": "игра",
+    "player": "жалоба",
+    "admin": "жалоба",
+    "territory": "приват",
+    "donation": "донат",
+    "event": "ивент",
+    "other": "другое",
+}
 
 
 # ============================================================
@@ -579,7 +590,7 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             )
         try:
             channel = await interaction.guild.create_text_channel(
-                channel_name("ивент", interaction.user),
+                channel_name(TICKET_CHANNEL_PREFIXES["event"], interaction.user),
                 category=category,
                 overwrites=overwrites,
                 topic=f"{EVENT_PREFIX}{interaction.user.id};pending",
@@ -932,7 +943,13 @@ class HelpForm(discord.ui.Modal):
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
         }
-        channel = await interaction.guild.create_text_channel(channel_name("обращение", interaction.user), category=category, overwrites=overwrites, topic=f"{TICKET_PREFIX}{interaction.user.id};{self.kind}", reason=f"Обращение от {interaction.user}")
+        channel = await interaction.guild.create_text_channel(
+            channel_name(TICKET_CHANNEL_PREFIXES.get(self.kind, "обращение"), interaction.user),
+            category=category,
+            overwrites=overwrites,
+            topic=f"{TICKET_PREFIX}{interaction.user.id};{self.kind}",
+            reason=f"Обращение от {interaction.user}",
+        )
         title, fields = FORMS[self.kind]
         embed = discord.Embed(title=title, colour=colour(TICKET_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Автор", value=interaction.user.mention, inline=False)
