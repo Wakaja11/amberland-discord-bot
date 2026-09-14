@@ -256,12 +256,17 @@ class Bot(commands.Bot):
         action: str,
         fields: dict[str, object] | None = None,
         avatar_url: str | None = None,
+        embed_color_html: str | None = None,
     ) -> None:
         logging.info("%s | %s", action, fields or {})
         channel = guild.get_channel(LOG_CHANNEL_ID)
         if isinstance(channel, discord.TextChannel):
             try:
-                embed = discord.Embed(title=f"Лог • {action}", colour=colour(LOG_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+                embed = discord.Embed(
+                    title=f"Лог • {action}",
+                    colour=colour(embed_color_html or LOG_EMBED_COLOR_HTML),
+                    timestamp=datetime.now(timezone.utc),
+                )
                 if avatar_url:
                     embed.set_thumbnail(url=avatar_url)
                 for name, value in (fields or {}).items():
@@ -642,8 +647,12 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
         }
         log_fields.update({name: value for name, value in details.items() if name != "Пользователь"})
         log_fields["Причина"] = self.reason.value
-        await bot.log(interaction.guild, "Заявка на ивент отклонена", log_fields,
+        await bot.log(
+            interaction.guild,
+            "Заявка на ивент отклонена",
+            log_fields,
             avatar_url=str(applicant.display_avatar.url) if applicant else None,
+            embed_color_html=APPLICATION_REJECTED_COLOR_HTML,
         )
         await interaction.response.send_message("Заявка на ивент отклонена", ephemeral=True)
         await asyncio.sleep(2)
@@ -740,13 +749,19 @@ class EventDecision(discord.ui.View):
         await interaction.channel.edit(topic=f"{EVENT_PREFIX}{self.user_id};accepted", reason=f"Ивент одобрен {interaction.user}")
         if interaction.message:
             await interaction.message.edit(view=None)
-        await bot.log(interaction.guild, "Ивент одобрен", {
-            "Модератор": interaction.user.mention,
-            "Пользователь": applicant.mention if applicant else f"<@{self.user_id}>",
-            "Название ивента": name,
-            "Дата и время по МСК": event_time,
-            "Описание": description,
-        }, avatar_url=str(applicant.display_avatar.url) if applicant else None)
+        await bot.log(
+            interaction.guild,
+            "Ивент одобрен",
+            {
+                "Модератор": interaction.user.mention,
+                "Пользователь": applicant.mention if applicant else f"<@{self.user_id}>",
+                "Название ивента": name,
+                "Дата и время по МСК": event_time,
+                "Описание": description,
+            },
+            avatar_url=str(applicant.display_avatar.url) if applicant else None,
+            embed_color_html=APPLICATION_ACCEPTED_COLOR_HTML,
+        )
         result = "Ивент одобрен и опубликован в канале ивентов"
         if skipped_photos:
             result += f". Не удалось отправить фотографий: {skipped_photos}"
@@ -799,8 +814,12 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
         }
         log_fields.update({name: value for name, value in details.items() if name != "Пользователь"})
         log_fields["Причина"] = self.reason.value
-        await bot.log(interaction.guild, "Заявка отклонена", log_fields,
+        await bot.log(
+            interaction.guild,
+            "Заявка отклонена",
+            log_fields,
             avatar_url=str(avatar_owner.display_avatar.url) if avatar_owner else None,
+            embed_color_html=APPLICATION_REJECTED_COLOR_HTML,
         )
         bot.store.remove_application(interaction.channel.id)
         await interaction.response.send_message("Заявка отклонена", ephemeral=True)
@@ -848,6 +867,7 @@ class ApplicationDecision(discord.ui.View):
             "Заявка принята",
             {"Модератор": interaction.user.mention, **details},
             avatar_url=str(applicant.display_avatar.url),
+            embed_color_html=APPLICATION_ACCEPTED_COLOR_HTML,
         )
         bot.store.remove_application(interaction.channel.id)
         await interaction.followup.send("Заявка принята: игрок выдан, гость снят", ephemeral=True)
