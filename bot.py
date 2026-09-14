@@ -996,7 +996,10 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
         "Пользователь": user.mention,
         "Тема обращения": ticket_topic(interaction.channel),
     })
-    await interaction.response.send_message(f"{user.mention} добавлен в обращение", ephemeral=True)
+    await interaction.response.send_message(
+        f"Игрок {user.mention} добавлен в тикет",
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
 
 
 class TicketCloseForm(discord.ui.Modal, title="Закрытие обращения"):
