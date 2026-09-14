@@ -991,11 +991,6 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
         read_message_history=True,
         reason=f"Добавлен в обращение {interaction.user}",
     )
-    await bot.log(interaction.guild, "Пользователь добавлен в обращение", {
-        "Модератор": interaction.user.mention,
-        "Пользователь": user.mention,
-        "Тема обращения": ticket_topic(interaction.channel),
-    })
     await interaction.response.send_message(
         f"Игрок {user.mention} добавлен в тикет",
         allowed_mentions=discord.AllowedMentions(users=True),
