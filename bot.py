@@ -139,6 +139,13 @@ def owner(channel: discord.abc.GuildChannel, prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def embed_details(message: discord.Message, title: str) -> dict[str, str]:
+    for embed in message.embeds:
+        if embed.title == title:
+            return {field.name: field.value for field in embed.fields}
+    return {}
+
+
 async def application_nickname(channel: discord.TextChannel) -> str | None:
     nickname = bot.store.application_nickname(channel.id)
     if nickname:
@@ -150,9 +157,9 @@ async def application_nickname(channel: discord.TextChannel) -> str | None:
 async def application_details(channel: discord.TextChannel) -> dict[str, str]:
     try:
         async for message in channel.history(limit=25, oldest_first=True):
-            for embed in message.embeds:
-                if embed.title == "Новая заявка":
-                    return {field.name: field.value for field in embed.fields}
+            details = embed_details(message, "Новая заявка")
+            if details:
+                return details
     except discord.HTTPException:
         pass
     return {}
@@ -161,9 +168,9 @@ async def application_details(channel: discord.TextChannel) -> dict[str, str]:
 async def event_details(channel: discord.TextChannel) -> dict[str, str]:
     try:
         async for message in channel.history(limit=1000, oldest_first=True):
-            for embed in message.embeds:
-                if embed.title == "Заявка на проведение ивента":
-                    return {field.name: field.value for field in embed.fields}
+            details = embed_details(message, "Заявка на проведение ивента")
+            if details:
+                return details
     except discord.HTTPException:
         pass
     return {}
@@ -227,7 +234,7 @@ def run_rcon_command(command: str) -> str:
 
 
 async def rcon_command(command: str) -> str:
-    return run_rcon_command(command)
+    return await asyncio.to_thread(run_rcon_command, command)
 
 
 async def whitelist_player(nickname: str) -> str:
@@ -636,6 +643,7 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
             return
+        await interaction.response.defer(ephemeral=True)
         applicant = interaction.guild.get_member(self.user_id)
         details = await event_details(interaction.channel)
         if applicant:
@@ -665,7 +673,7 @@ class EventRejectionForm(discord.ui.Modal, title="Отклонение заяв�
             avatar_url=str(applicant.display_avatar.url) if applicant else None,
             embed_color_html=APPLICATION_REJECTED_COLOR_HTML,
         )
-        await interaction.response.send_message("Заявка на ивент отклонена", ephemeral=True)
+        await interaction.followup.send("Заявка на ивент отклонена", ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Заявка на ивент отклонена")
 
@@ -690,13 +698,14 @@ class EventReworkForm(discord.ui.Modal, title="Доработка ивента")
         if applicant is None:
             await interaction.response.send_message("Пользователь больше не находится на сервере", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         try:
             message = await interaction.channel.fetch_message(self.message_id)
         except discord.NotFound:
-            await interaction.response.send_message("Сообщение с заявкой не найдено", ephemeral=True)
+            await interaction.followup.send("Сообщение с заявкой не найдено", ephemeral=True)
             return
         await message.edit(embed=event_application_embed(applicant, self.event_name.value, self.event_time.value, self.description.value))
-        await interaction.response.send_message("Данные заявки обновлены", ephemeral=True)
+        await interaction.followup.send("Данные заявки обновлены", ephemeral=True)
 
 
 class EventDecision(discord.ui.View):
@@ -711,24 +720,24 @@ class EventDecision(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not await staff(interaction) or not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
             return
+        await interaction.response.defer(ephemeral=True)
         details = await event_details(interaction.channel)
         name = details.get("Название ивента")
         event_time = details.get("Дата и время по МСК") or details.get("Дата и время проведения")
         description = details.get("Описание")
         if not name or not event_time or not description:
-            await interaction.response.send_message("Не удалось найти данные заявки на ивент", ephemeral=True)
+            await interaction.followup.send("Не удалось найти данные заявки на ивент", ephemeral=True)
             return
         events_channel = interaction.guild.get_channel(EVENTS_CHANNEL_ID)
         event_role = interaction.guild.get_role(EVENTS_ROLE_ID)
         if not isinstance(events_channel, discord.TextChannel) or event_role is None:
-            await interaction.response.send_message("Не найден канал или роль ивентов из настроек бота", ephemeral=True)
+            await interaction.followup.send("Не найден канал или роль ивентов из настроек бота", ephemeral=True)
             return
         applicant = interaction.guild.get_member(self.user_id)
         organizer_name = applicant.display_name if applicant else str(self.user_id)
         title_embed = discord.Embed(title=name, colour=colour(APPLICATION_EMBED_COLOR_HTML))
         description_embed = discord.Embed(description=description, colour=colour(APPLICATION_EMBED_COLOR_HTML))
         description_embed.set_footer(text=f"{event_time} • {organizer_name}")
-        await interaction.response.defer(ephemeral=True)
         try:
             await events_channel.send(content=event_role.mention, embed=title_embed, allowed_mentions=discord.AllowedMentions(roles=True))
         except discord.Forbidden:
@@ -784,7 +793,7 @@ class EventDecision(discord.ui.View):
     async def rework(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not await staff(interaction) or not isinstance(interaction.channel, discord.TextChannel) or not interaction.message:
             return
-        details = await event_details(interaction.channel)
+        details = embed_details(interaction.message, "Заявка на проведение ивента")
         await show_modal(interaction, EventReworkForm(self.user_id, interaction.message.id, details))
 
     @discord.ui.button(label="Отклонить", style=discord.ButtonStyle.danger)
@@ -804,6 +813,7 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
             return
+        await interaction.response.defer(ephemeral=True)
         applicant = interaction.guild.get_member(self.user_id)
         details = await application_details(interaction.channel)
         if applicant:
@@ -833,7 +843,7 @@ class RejectionForm(discord.ui.Modal, title="Отклонение заявки")
             embed_color_html=APPLICATION_REJECTED_COLOR_HTML,
         )
         bot.store.remove_application(interaction.channel.id)
-        await interaction.response.send_message("Заявка отклонена", ephemeral=True)
+        await interaction.followup.send("Заявка отклонена", ephemeral=True)
         await asyncio.sleep(2)
         await interaction.channel.delete(reason="Заявка отклонена")
 
@@ -854,14 +864,14 @@ class ApplicationDecision(discord.ui.View):
         if not applicant:
             await interaction.response.send_message("Пользователь больше не находится на сервере", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         nickname = await application_nickname(interaction.channel)
         if not nickname:
-            await interaction.response.send_message("Не удалось найти никнейм из заявки", ephemeral=True)
+            await interaction.followup.send("Не удалось найти никнейм из заявки", ephemeral=True)
             return
         details = await application_details(interaction.channel)
         details["Пользователь"] = applicant.mention
         details.setdefault("Никнейм", nickname)
-        await interaction.response.defer(ephemeral=True)
         try:
             await whitelist_player(nickname)
         except RconError as error:
@@ -932,6 +942,7 @@ class HelpForm(discord.ui.Modal):
         if any(owner(channel, TICKET_PREFIX) == interaction.user.id for channel in category.text_channels):
             await interaction.response.send_message("У вас уже есть открытое обращение", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(
@@ -957,7 +968,7 @@ class HelpForm(discord.ui.Modal):
             value = item.value or "Не указано"
             embed.add_field(name=label, value=value, inline=False)
         await channel.send(content=f"{interaction.user.mention} {roles[2].mention} {roles[3].mention}", embed=embed, view=TicketControls(interaction.user.id), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-        await interaction.response.send_message(f"Обращение создано: {channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"Обращение создано: {channel.mention}", ephemeral=True)
 
 
 class HelpSelect(discord.ui.Select):
@@ -1021,6 +1032,7 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
         if roles:
             await interaction.response.send_message("Команду можно использовать только в канале обращения", ephemeral=True)
         return
+    await interaction.response.defer()
     await interaction.channel.set_permissions(
         user,
         view_channel=True,
@@ -1028,7 +1040,7 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
         read_message_history=True,
         reason=f"Добавлен в обращение {interaction.user}",
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Игрок {user.mention} добавлен в тикет",
         allowed_mentions=discord.AllowedMentions(users=True),
     )
@@ -1107,12 +1119,13 @@ class SlotsForm(discord.ui.Modal, title="Количество мест"):
         except ValueError:
             await interaction.response.send_message("Введите целое число от 1 до 99", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         await voice.edit(user_limit=value, reason=f"Лимит изменён {interaction.user}")
         try:
             await self.control_message.edit(view=VoiceControls(self.voice_id, self.user_id, self.closed))
         except discord.HTTPException:
             logging.exception("Не удалось обновить панель управления войсом %s", self.voice_id)
-        await interaction.response.send_message(f"Лимит участников изменён: {value}", ephemeral=True)
+        await interaction.followup.send(f"Лимит участников изменён: {value}", ephemeral=True)
 
 
 class RenameVoiceForm(discord.ui.Modal, title="Переименовать войс"):
@@ -1133,12 +1146,13 @@ class RenameVoiceForm(discord.ui.Modal, title="Переименовать вой
         if not new_name:
             await interaction.response.send_message("Название не может быть пустым", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         await voice.edit(name=new_name, reason=f"Войс переименован {interaction.user}")
         try:
             await self.control_message.edit(view=VoiceControls(self.voice_id, self.user_id, self.closed))
         except discord.HTTPException:
             logging.exception("Не удалось обновить панель управления войсом %s", self.voice_id)
-        await interaction.response.send_message(f"Войс переименован: **{discord.utils.escape_markdown(new_name)}**", ephemeral=True)
+        await interaction.followup.send(f"Войс переименован: **{discord.utils.escape_markdown(new_name)}**", ephemeral=True)
 
 
 async def voice_access(interaction: discord.Interaction, voice_id: int, user_id: int) -> tuple[discord.VoiceChannel | None, tuple[discord.Role, discord.Role, discord.Role, discord.Role] | None]:
@@ -1171,15 +1185,16 @@ class KickMemberSelect(discord.ui.UserSelect):
         if not isinstance(member, discord.Member) or member.voice is None or member.voice.channel != voice:
             await interaction.response.send_message("Этот участник уже не находится в войсе", ephemeral=True)
             return
+        await interaction.response.defer()
         try:
             await member.move_to(None, reason=f"Исключён из временного войса пользователем {interaction.user}")
         except discord.Forbidden:
-            await interaction.response.send_message("Боту не хватает права перемещать участников", ephemeral=True)
+            await interaction.followup.send("Боту не хватает права перемещать участников", ephemeral=True)
             return
         except discord.HTTPException:
-            await interaction.response.send_message("Не удалось исключить участника. Попробуйте ещё раз", ephemeral=True)
+            await interaction.followup.send("Не удалось исключить участника. Попробуйте ещё раз", ephemeral=True)
             return
-        await interaction.response.edit_message(content=f"{member.mention} исключён из войса", view=None)
+        await interaction.edit_original_response(content=f"{member.mention} исключён из войса", view=None)
 
 
 class KickMemberView(discord.ui.View):
@@ -1228,6 +1243,7 @@ class VoiceControls(discord.ui.View):
         voice, roles = await voice_access(interaction, self.voice_id, self.user_id)
         if not voice or not roles:
             return
+        await interaction.response.defer()
         self.closed = not self.closed
         await voice.set_permissions(
             interaction.guild.default_role,
@@ -1250,7 +1266,7 @@ class VoiceControls(discord.ui.View):
         bot.store.close_voice(self.voice_id, self.closed)
         button.label = "Войс закрыт" if self.closed else "Войс открыт"
         button.style = discord.ButtonStyle.danger if self.closed else discord.ButtonStyle.success
-        await interaction.response.edit_message(view=self)
+        await interaction.edit_original_response(view=self)
 
 
 def voice_control_embed() -> discord.Embed:
@@ -1346,10 +1362,11 @@ async def setup(interaction: discord.Interaction) -> None:
     if not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Команда доступна только администраторам", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     await bot.roles(interaction.guild)
     await panels(interaction.guild)
     await restore(interaction.guild)
-    await interaction.response.send_message("Панели и активные кнопки проверены", ephemeral=True)
+    await interaction.followup.send("Панели и активные кнопки проверены", ephemeral=True)
 
 
 async def main() -> None:
