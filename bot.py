@@ -704,6 +704,14 @@ async def moderation_target(
     if member.id == interaction.guild.owner_id:
         await interaction.response.send_message("Владельцу сервера нельзя выдать это наказание", ephemeral=True)
         return None
+    moderator_is_admin = interaction.user.guild_permissions.administrator or roles[3] in interaction.user.roles
+    target_is_staff = member.guild_permissions.administrator or roles[2] in member.roles or roles[3] in member.roles
+    if target_is_staff and not moderator_is_admin:
+        await interaction.response.send_message(
+            "Хелперы не могут наказывать хелперов или администраторов",
+            ephemeral=True,
+        )
+        return None
     if bot_member is None or member.top_role >= bot_member.top_role:
         await interaction.response.send_message("Роль бота должна находиться выше роли этого пользователя", ephemeral=True)
         return None
