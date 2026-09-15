@@ -78,7 +78,7 @@ MODERATION_ROLE_NAMES = {
     "warn3": "Пред 3",
 }
 WARNING_LIFETIME_SECONDS = 3 * 24 * 60 * 60
-AUTOMATIC_BAN_SECONDS = 24 * 60 * 60
+AUTOMATIC_MUTE_SECONDS = 24 * 60 * 60
 PUNISHMENT_HISTORY_SECONDS = 30 * 24 * 60 * 60
 
 
@@ -435,7 +435,7 @@ class Bot(commands.Bot):
         self.started = False
         self.interaction_ids: set[int] = set()
         self.moderation_lock = asyncio.Lock()
-        self.automatic_bans: set[tuple[int, int]] = set()
+        self.automatic_mutes: set[tuple[int, int]] = set()
 
     def claim_interaction(self, interaction_id: int) -> bool:
         if interaction_id in self.interaction_ids:
@@ -1759,10 +1759,10 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     roles = await moderation_roles(interaction.guild)
     now = int(datetime.now(timezone.utc).timestamp())
     expires_at = now + WARNING_LIFETIME_SECONDS
-    automatic_ban_key = (interaction.guild.id, member.id)
+    automatic_mute_key = (interaction.guild.id, member.id)
     async with bot.moderation_lock:
-        if automatic_ban_key in bot.automatic_bans:
-            await interaction.followup.send("Для пользователя уже выполняется автоматическая блокировка", ephemeral=True)
+        if automatic_mute_key in bot.automatic_mutes:
+            await interaction.followup.send("Для пользователя уже выполняется автоматический мут", ephemeral=True)
             return
         punishment_id = bot.store.add_punishment(
             interaction.guild.id,
@@ -1781,7 +1781,7 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
             await interaction.followup.send("Боту не хватает прав, чтобы выдать роль предупреждения", ephemeral=True)
             return
         if warning_count >= 3:
-            bot.automatic_bans.add(automatic_ban_key)
+            bot.automatic_mutes.add(automatic_mute_key)
     notice_sent = await dm(
         member,
         punishment_embed(
@@ -1807,30 +1807,37 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
         return
 
     automatic_reason = "Получено 3 предупреждения"
-    ban_expires_at = now + AUTOMATIC_BAN_SECONDS
-    clear_reason = "Предупреждения сняты после автоматического бана"
-    ban_succeeded = False
+    mute_expires_at = now + AUTOMATIC_MUTE_SECONDS
+    clear_reason = "Предупреждения сняты после автоматического мута"
+    permission_failures = 0
     try:
-        await dm(member, punishment_embed("Вы заблокированы на сервере", None, automatic_reason, duration=f"1 день (до <t:{ban_expires_at}:f>)", appeal=True))
-        await interaction.guild.ban(member, reason=audit_reason("Автоматический бан", None, automatic_reason), delete_message_seconds=0)
-        ban_succeeded = True
+        async with bot.moderation_lock:
+            active_mutes = bot.store.active_punishments(interaction.guild.id, member.id, "mute")
+            existing_expiries = [int(row["expires_at"]) for row in active_mutes if row["expires_at"]]
+            if existing_expiries:
+                mute_expires_at = max(mute_expires_at, max(existing_expiries))
+            if roles["mute"] not in member.roles:
+                await member.add_roles(roles["mute"], reason=audit_reason("Автоматический мут", None, automatic_reason))
+            permission_failures = await apply_member_mute_overwrites(member)
+            bot.store.deactivate_all(interaction.guild.id, member.id, "mute")
+            bot.store.add_punishment(interaction.guild.id, member.id, "mute", None, automatic_reason, expires_at=mute_expires_at, active=True, created_at=now)
+            bot.store.deactivate_all(interaction.guild.id, member.id, "warn")
+            bot.store.add_punishment(interaction.guild.id, member.id, "unwarn", None, clear_reason, created_at=now)
     except discord.Forbidden:
-        await interaction.followup.send("Предупреждение выдано, но боту не хватило прав для автоматического бана", ephemeral=True)
+        await interaction.followup.send("Предупреждение выдано, но боту не хватило прав для автоматического мута", ephemeral=True)
         return
     except discord.HTTPException:
-        logging.exception("Не удалось автоматически заблокировать пользователя %s", member.id)
-        await interaction.followup.send("Предупреждение выдано, но Discord не принял автоматический бан", ephemeral=True)
+        logging.exception("Не удалось автоматически выдать мут пользователю %s", member.id)
+        await interaction.followup.send("Предупреждение выдано, но Discord не принял автоматический мут", ephemeral=True)
         return
     finally:
         async with bot.moderation_lock:
-            if ban_succeeded:
-                bot.store.add_punishment(interaction.guild.id, member.id, "ban", None, automatic_reason, expires_at=ban_expires_at, active=True, created_at=now)
-                bot.store.deactivate_all(interaction.guild.id, member.id, "warn")
-                bot.store.add_punishment(interaction.guild.id, member.id, "unwarn", None, clear_reason, created_at=now)
-            bot.automatic_bans.discard(automatic_ban_key)
+            bot.automatic_mutes.discard(automatic_mute_key)
+    await dm(member, punishment_embed("Вам выдан мут", None, automatic_reason, duration=f"до <t:{mute_expires_at}:f>"))
     await log_punishment(interaction.guild, "Предупреждения сняты", member, None, clear_reason, colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
-    await log_punishment(interaction.guild, "Пользователь автоматически заблокирован", member, None, automatic_reason, duration=f"до <t:{ban_expires_at}:f>")
-    await interaction.followup.send(f"{member} получил третье предупреждение и заблокирован на сутки", ephemeral=True)
+    await log_punishment(interaction.guild, "Пользователю автоматически выдан мут", member, None, automatic_reason, duration=f"до <t:{mute_expires_at}:f>")
+    suffix = f". Не удалось обновить права в каналах: {permission_failures}" if permission_failures else ""
+    await interaction.followup.send(f"{member.mention} получил третье предупреждение и мут до <t:{mute_expires_at}:f>{suffix}", ephemeral=True)
 
 
 @bot.tree.command(name="разпред", description="Снять последнее активное предупреждение")
