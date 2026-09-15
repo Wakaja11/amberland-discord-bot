@@ -6,11 +6,11 @@ import os
 import re
 import sqlite3
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 
@@ -68,8 +68,18 @@ TICKET_CHANNEL_PREFIXES = {
     "territory": "приват",
     "donation": "донат",
     "event": "ивент",
+    "appeal": "апелляция",
     "other": "другое",
 }
+MODERATION_ROLE_NAMES = {
+    "mute": "Мут",
+    "warn1": "Пред 1",
+    "warn2": "Пред 2",
+    "warn3": "Пред 3",
+}
+WARNING_LIFETIME_SECONDS = 3 * 24 * 60 * 60
+AUTOMATIC_BAN_SECONDS = 24 * 60 * 60
+PUNISHMENT_HISTORY_SECONDS = 30 * 24 * 60 * 60
 
 
 # ============================================================
@@ -80,11 +90,22 @@ TICKET_CHANNEL_PREFIXES = {
 class Store:
     def __init__(self) -> None:
         self.db = sqlite3.connect(DB_FILE)
+        self.db.row_factory = sqlite3.Row
         self.db.executescript(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "CREATE TABLE IF NOT EXISTS members (guild_id INTEGER, user_id INTEGER, PRIMARY KEY(guild_id,user_id));"
             "CREATE TABLE IF NOT EXISTS voices (voice_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, closed INTEGER NOT NULL DEFAULT 0);"
             "CREATE TABLE IF NOT EXISTS applications (channel_id INTEGER PRIMARY KEY, nickname TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS punishments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
+            "kind TEXT NOT NULL, moderator_id INTEGER, reason TEXT NOT NULL, created_at INTEGER NOT NULL, "
+            "expires_at INTEGER, active INTEGER NOT NULL DEFAULT 0);"
+            "CREATE INDEX IF NOT EXISTS punishments_user_time ON punishments(guild_id,user_id,created_at);"
+            "CREATE INDEX IF NOT EXISTS punishments_expiry ON punishments(active,expires_at);"
+            "CREATE TABLE IF NOT EXISTS mute_overwrites ("
+            "guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+            "allow_value TEXT NOT NULL, deny_value TEXT NOT NULL, "
+            "PRIMARY KEY(guild_id,user_id,channel_id));"
         )
         self.db.commit()
 
@@ -127,6 +148,115 @@ class Store:
 
     def voices(self) -> list[tuple[int, int, bool]]:
         return [(voice_id, owner_id, bool(closed)) for voice_id, owner_id, closed in self.db.execute("SELECT voice_id,owner_id,closed FROM voices")]
+
+    def add_punishment(
+        self,
+        guild_id: int,
+        user_id: int,
+        kind: str,
+        moderator_id: int | None,
+        reason: str,
+        *,
+        expires_at: int | None = None,
+        active: bool = False,
+        created_at: int | None = None,
+    ) -> int:
+        cursor = self.db.execute(
+            "INSERT INTO punishments(guild_id,user_id,kind,moderator_id,reason,created_at,expires_at,active) VALUES(?,?,?,?,?,?,?,?)",
+            (guild_id, user_id, kind, moderator_id, reason, created_at or int(datetime.now(timezone.utc).timestamp()), expires_at, int(active)),
+        )
+        self.db.commit()
+        return int(cursor.lastrowid)
+
+    def active_punishments(self, guild_id: int, user_id: int, kind: str | None = None) -> list[sqlite3.Row]:
+        if kind is None:
+            return list(self.db.execute(
+                "SELECT * FROM punishments WHERE guild_id=? AND user_id=? AND active=1 ORDER BY created_at,id",
+                (guild_id, user_id),
+            ))
+        return list(self.db.execute(
+            "SELECT * FROM punishments WHERE guild_id=? AND user_id=? AND kind=? AND active=1 ORDER BY created_at,id",
+            (guild_id, user_id, kind),
+        ))
+
+    def active_count(self, guild_id: int, user_id: int, kind: str) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM punishments WHERE guild_id=? AND user_id=? AND kind=? AND active=1",
+            (guild_id, user_id, kind),
+        ).fetchone()
+        return int(row[0])
+
+    def deactivate(self, punishment_id: int) -> None:
+        self.db.execute("UPDATE punishments SET active=0 WHERE id=?", (punishment_id,))
+        self.db.commit()
+
+    def activate(self, punishment_id: int) -> None:
+        self.db.execute("UPDATE punishments SET active=1 WHERE id=?", (punishment_id,))
+        self.db.commit()
+
+    def deactivate_all(self, guild_id: int, user_id: int, kind: str) -> list[sqlite3.Row]:
+        rows = self.active_punishments(guild_id, user_id, kind)
+        if rows:
+            self.db.executemany("UPDATE punishments SET active=0 WHERE id=?", ((row["id"],) for row in rows))
+            self.db.commit()
+        return rows
+
+    def deactivate_latest_warning(self, guild_id: int, user_id: int) -> sqlite3.Row | None:
+        row = self.db.execute(
+            "SELECT * FROM punishments WHERE guild_id=? AND user_id=? AND kind='warn' AND active=1 ORDER BY created_at DESC,id DESC LIMIT 1",
+            (guild_id, user_id),
+        ).fetchone()
+        if row:
+            self.deactivate(int(row["id"]))
+        return row
+
+    def expired_punishments(self, guild_id: int, now: int) -> list[sqlite3.Row]:
+        return list(self.db.execute(
+            "SELECT * FROM punishments WHERE guild_id=? AND active=1 AND expires_at IS NOT NULL AND expires_at<=? ORDER BY expires_at,id",
+            (guild_id, now),
+        ))
+
+    def punishment_history(self, guild_id: int, user_id: int, since: int) -> list[sqlite3.Row]:
+        return list(self.db.execute(
+            "SELECT * FROM punishments WHERE guild_id=? AND user_id=? AND created_at>=? ORDER BY created_at DESC,id DESC",
+            (guild_id, user_id, since),
+        ))
+
+    def punishment_user_ids(self, guild_id: int) -> list[int]:
+        return [int(row[0]) for row in self.db.execute(
+            "SELECT DISTINCT user_id FROM punishments WHERE guild_id=? AND active=1",
+            (guild_id,),
+        )]
+
+    def active_user_ids(self, guild_id: int, kind: str) -> list[int]:
+        return [int(row[0]) for row in self.db.execute(
+            "SELECT DISTINCT user_id FROM punishments WHERE guild_id=? AND kind=? AND active=1",
+            (guild_id, kind),
+        )]
+
+    def save_mute_overwrite(self, guild_id: int, user_id: int, channel_id: int, allow_value: int, deny_value: int) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO mute_overwrites(guild_id,user_id,channel_id,allow_value,deny_value) VALUES(?,?,?,?,?)",
+            (guild_id, user_id, channel_id, str(allow_value), str(deny_value)),
+        )
+        self.db.commit()
+
+    def mute_overwrites(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
+        return list(self.db.execute(
+            "SELECT * FROM mute_overwrites WHERE guild_id=? AND user_id=? ORDER BY channel_id",
+            (guild_id, user_id),
+        ))
+
+    def remove_mute_overwrite(self, guild_id: int, user_id: int, channel_id: int) -> None:
+        self.db.execute(
+            "DELETE FROM mute_overwrites WHERE guild_id=? AND user_id=? AND channel_id=?",
+            (guild_id, user_id, channel_id),
+        )
+        self.db.commit()
+
+    def purge_old_punishments(self, before: int) -> None:
+        self.db.execute("DELETE FROM punishments WHERE active=0 AND created_at<?", (before,))
+        self.db.commit()
 
 
 # ============================================================
@@ -304,6 +434,8 @@ class Bot(commands.Bot):
         self.store = Store()
         self.started = False
         self.interaction_ids: set[int] = set()
+        self.moderation_lock = asyncio.Lock()
+        self.automatic_bans: set[tuple[int, int]] = set()
 
     def claim_interaction(self, interaction_id: int) -> bool:
         if interaction_id in self.interaction_ids:
@@ -352,6 +484,8 @@ class Bot(commands.Bot):
         guild = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild)
         await self.tree.sync()
+        if not punishment_expiry_loop.is_running():
+            punishment_expiry_loop.start()
 
     async def on_ready(self) -> None:
         if self.started:
@@ -360,6 +494,7 @@ class Bot(commands.Bot):
         for guild in self.guilds:
             try:
                 await self.roles(guild)
+                await setup_moderation(guild)
                 await panels(guild)
                 await restore(guild)
                 logging.info("Бот запущен: сервер %s, панели и кнопки проверены.", guild.name)
@@ -385,7 +520,7 @@ async def dm(member: discord.Member, embed: discord.Embed) -> bool:
     try:
         await member.send(embed=embed)
         return True
-    except discord.Forbidden:
+    except discord.HTTPException:
         return False
 
 
@@ -398,6 +533,243 @@ async def show_modal(interaction: discord.Interaction, modal: discord.ui.Modal) 
         if error.code not in (10062, 40060):
             raise
         logging.warning("Пропущено повторное или устаревшее нажатие кнопки: %s", interaction.id)
+
+
+async def moderation_roles(guild: discord.Guild) -> dict[str, discord.Role]:
+    result: dict[str, discord.Role] = {}
+    for key, name in MODERATION_ROLE_NAMES.items():
+        role_id = bot.store.get(f"moderation_role:{guild.id}:{key}")
+        role = guild.get_role(role_id) if role_id else None
+        if role is None:
+            role = discord.utils.get(guild.roles, name=name)
+        if role is None:
+            role = await guild.create_role(name=name, reason="Настройка системы модерации")
+        bot.store.set(f"moderation_role:{guild.id}:{key}", role.id)
+        result[key] = role
+    return result
+
+
+async def apply_mute_overwrite(channel: discord.abc.GuildChannel, mute_role: discord.Role) -> None:
+    overwrite = channel.overwrites_for(mute_role)
+    changed = False
+    denied_permissions = (
+        "send_messages",
+        "send_messages_in_threads",
+        "send_voice_messages",
+        "create_public_threads",
+        "create_private_threads",
+        "add_reactions",
+        "speak",
+        "stream",
+        "request_to_speak",
+        "use_soundboard",
+        "use_external_sounds",
+    )
+    for permission in denied_permissions:
+        if permission in discord.Permissions.VALID_FLAGS and getattr(overwrite, permission) is not False:
+            setattr(overwrite, permission, False)
+            changed = True
+    if changed:
+        await channel.set_permissions(mute_role, overwrite=overwrite, reason="Настройка роли мута")
+
+
+def is_appeal_channel_for(channel: discord.abc.GuildChannel, user_id: int) -> bool:
+    return (
+        isinstance(channel, discord.TextChannel)
+        and owner(channel, TICKET_PREFIX) == user_id
+        and (channel.topic or "").partition(";")[2] == "appeal"
+    )
+
+
+async def apply_member_mute_overwrite(channel: discord.abc.GuildChannel, member: discord.Member) -> bool:
+    if is_appeal_channel_for(channel, member.id):
+        return True
+    denied_permissions = (
+        "send_messages",
+        "send_messages_in_threads",
+        "send_voice_messages",
+        "create_public_threads",
+        "create_private_threads",
+        "add_reactions",
+        "speak",
+        "stream",
+        "request_to_speak",
+        "use_soundboard",
+        "use_external_sounds",
+    )
+    overwrite = channel.overwrites_for(member)
+    allow, deny = overwrite.pair()
+    bot.store.save_mute_overwrite(member.guild.id, member.id, channel.id, allow.value, deny.value)
+    changed = False
+    for permission in denied_permissions:
+        if permission in discord.Permissions.VALID_FLAGS and getattr(overwrite, permission) is not False:
+            setattr(overwrite, permission, False)
+            changed = True
+    if not changed:
+        return True
+    try:
+        await channel.set_permissions(member, overwrite=overwrite, reason="Применение мута")
+    except discord.HTTPException:
+        logging.exception("Не удалось применить мут пользователю %s в канале %s", member.id, channel.id)
+        return False
+    return True
+
+
+async def apply_member_mute_overwrites(member: discord.Member) -> int:
+    failed = 0
+    for channel in member.guild.channels:
+        if not await apply_member_mute_overwrite(channel, member):
+            failed += 1
+    return failed
+
+
+async def restore_member_mute_overwrites(member: discord.Member) -> int:
+    failed = 0
+    for row in bot.store.mute_overwrites(member.guild.id, member.id):
+        channel = member.guild.get_channel(int(row["channel_id"]))
+        if channel is None:
+            bot.store.remove_mute_overwrite(member.guild.id, member.id, int(row["channel_id"]))
+            continue
+        allow = discord.Permissions(int(row["allow_value"]))
+        deny = discord.Permissions(int(row["deny_value"]))
+        overwrite = discord.PermissionOverwrite.from_pair(allow, deny)
+        try:
+            await channel.set_permissions(
+                member,
+                overwrite=overwrite if allow.value or deny.value else None,
+                reason="Снятие мута",
+            )
+        except discord.HTTPException:
+            failed += 1
+            logging.exception("Не удалось восстановить права пользователя %s в канале %s", member.id, channel.id)
+            continue
+        bot.store.remove_mute_overwrite(member.guild.id, member.id, channel.id)
+    return failed
+
+
+async def sync_warning_roles(member: discord.Member, roles: dict[str, discord.Role]) -> int:
+    count = min(bot.store.active_count(member.guild.id, member.id, "warn"), 3)
+    warning_roles = [roles["warn1"], roles["warn2"], roles["warn3"]]
+    desired = warning_roles[count - 1] if count else None
+    to_remove = [role for role in warning_roles if role in member.roles and role != desired]
+    if to_remove:
+        await member.remove_roles(*to_remove, reason="Обновление количества предупреждений")
+    if desired is not None and desired not in member.roles:
+        await member.add_roles(desired, reason="Обновление количества предупреждений")
+    return count
+
+
+async def restore_member_punishments(member: discord.Member, roles: dict[str, discord.Role]) -> None:
+    if bot.store.active_count(member.guild.id, member.id, "mute"):
+        if roles["mute"] not in member.roles:
+            await member.add_roles(roles["mute"], reason="Восстановление активного мута")
+        await apply_member_mute_overwrites(member)
+    else:
+        await restore_member_mute_overwrites(member)
+    await sync_warning_roles(member, roles)
+
+
+async def setup_moderation(guild: discord.Guild) -> None:
+    async with bot.moderation_lock:
+        roles = await moderation_roles(guild)
+        for channel in guild.channels:
+            try:
+                await apply_mute_overwrite(channel, roles["mute"])
+            except discord.HTTPException:
+                logging.exception("Не удалось настроить роль мута в канале %s", channel.id)
+        await process_expired_punishments(guild, roles)
+        for user_id in bot.store.punishment_user_ids(guild.id):
+            member = guild.get_member(user_id)
+            if member is not None:
+                try:
+                    await restore_member_punishments(member, roles)
+                except discord.HTTPException:
+                    logging.exception("Не удалось восстановить наказания пользователя %s", user_id)
+
+
+async def moderation_target(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> tuple[discord.Role, discord.Role, discord.Role, discord.Role] | None:
+    roles = await staff(interaction)
+    if not roles or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return None
+    bot_member = interaction.guild.me
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("Нельзя выдать наказание самому себе", ephemeral=True)
+        return None
+    if member.bot:
+        await interaction.response.send_message("Ботам нельзя выдавать наказания через эту систему", ephemeral=True)
+        return None
+    if member.id == interaction.guild.owner_id:
+        await interaction.response.send_message("Владельцу сервера нельзя выдать это наказание", ephemeral=True)
+        return None
+    if bot_member is None or member.top_role >= bot_member.top_role:
+        await interaction.response.send_message("Роль бота должна находиться выше роли этого пользователя", ephemeral=True)
+        return None
+    if interaction.user.id != interaction.guild.owner_id and member.top_role >= interaction.user.top_role:
+        await interaction.response.send_message("Нельзя наказать пользователя с равной или более высокой ролью", ephemeral=True)
+        return None
+    return roles
+
+
+def parse_duration(value: str) -> tuple[int, str] | None:
+    match = re.fullmatch(r"([1-9]\d*)([мчд])", value.strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    seconds_per_unit = {"м": 60, "ч": 60 * 60, "д": 24 * 60 * 60}
+    unit_names = {"м": "мин.", "ч": "ч.", "д": "дн."}
+    seconds = amount * seconds_per_unit[unit]
+    if seconds > 10 * 365 * 24 * 60 * 60:
+        return None
+    return seconds, f"{amount} {unit_names[unit]}"
+
+
+def punishment_embed(
+    title: str,
+    moderator: discord.Member | None,
+    reason: str,
+    *,
+    duration: str | None = None,
+    extra: str | None = None,
+    appeal: bool = False,
+) -> discord.Embed:
+    lines = [f"**Причина:** {reason}", f"**Модератор:** {moderator.mention if moderator else 'Система'}"]
+    if duration:
+        lines.insert(0, f"**Срок:** {duration}")
+    if extra:
+        lines.append(extra)
+    if appeal:
+        lines.append("Для обжалования наказания напишите модератору в личные сообщения")
+    return discord.Embed(title=title, description="\n".join(lines), colour=colour(APPLICATION_REJECTED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
+
+
+async def log_punishment(
+    guild: discord.Guild,
+    action: str,
+    user: discord.abc.User,
+    moderator: discord.Member | None,
+    reason: str,
+    *,
+    duration: str | None = None,
+    colour_html: str = APPLICATION_REJECTED_COLOR_HTML,
+) -> None:
+    fields: dict[str, object] = {
+        "Пользователь": f"{user.mention} ({user})",
+        "Модератор": moderator.mention if moderator else "Система",
+        "Причина": reason,
+    }
+    if duration:
+        fields["Срок"] = duration
+    await bot.log(
+        guild,
+        action,
+        fields,
+        avatar_url=str(user.display_avatar.url),
+        embed_color_html=colour_html,
+    )
 
 
 async def panels(guild: discord.Guild) -> None:
@@ -615,6 +987,10 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
             await interaction.response.send_message("Заявку на проведение ивента могут подать только игроки", ephemeral=True)
             return
         roles = await bot.roles(interaction.guild)
+        mod_roles = await moderation_roles(interaction.guild)
+        if mod_roles["mute"] in interaction.user.roles:
+            await interaction.response.send_message("Во время мута нельзя подать заявку на проведение ивента", ephemeral=True)
+            return
         category = interaction.guild.get_channel(TICKET_CATEGORY_ID)
         if not isinstance(category, discord.CategoryChannel):
             await interaction.response.send_message("Категория помощи не найдена", ephemeral=True)
@@ -633,6 +1009,7 @@ class EventForm(discord.ui.Modal, title="Провести ивент"):
         await interaction.response.defer(ephemeral=True)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            mod_roles["mute"]: discord.PermissionOverwrite(send_messages=False, send_messages_in_threads=False, add_reactions=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
             roles[2]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
             roles[3]: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True),
@@ -965,6 +1342,7 @@ FORMS = {
     "territory": ("Вопрос о территории", (("Ваш никнейм", True), ("Название территории или координаты", True), ("Ваш вопрос", True))),
     "donation": ("Проблема с донатом", (("Ваш никнейм", True), ("Что было приобретено?", True), ("Описание проблемы", True), ("Номер платежа (если есть)", False))),
     "admin": ("Жалоба на администратора", (("Ваш никнейм", True), ("Никнейм администратора", True), ("Что случилось?", True))),
+    "appeal": ("Обжаловать наказание", (("Ваш никнейм", True), ("Какое наказание обжалуете?", True), ("Кто выдал наказание?", False), ("Почему наказание нужно пересмотреть?", True))),
     "other": ("Другое", (("Ваш никнейм", True), ("Опишите ситуацию", True))),
 }
 
@@ -975,7 +1353,7 @@ class HelpForm(discord.ui.Modal):
         super().__init__(title=title[:45])
         self.kind = kind
         self.inputs: list[discord.ui.TextInput] = []
-        long = {"Описание бага", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите проблему", "Как повторить проблему?", "Опишите ситуацию"}
+        long = {"Описание бага", "Что случилось?", "Что именно не работает?", "Ваш вопрос", "Описание проблемы", "Опишите проблему", "Как повторить проблему?", "Почему наказание нужно пересмотреть?", "Опишите ситуацию"}
         for label, required in fields:
             item = discord.ui.TextInput(label=label, required=required, style=discord.TextStyle.paragraph if label in long else discord.TextStyle.short, max_length=1000)
             self.inputs.append(item)
@@ -986,16 +1364,28 @@ class HelpForm(discord.ui.Modal):
             await interaction.response.send_message("Обращение можно создать только на сервере", ephemeral=True)
             return
         roles = await bot.roles(interaction.guild)
+        mod_roles = await moderation_roles(interaction.guild)
         category = interaction.guild.get_channel(TICKET_CATEGORY_ID)
         if not isinstance(category, discord.CategoryChannel):
             await interaction.response.send_message("Категория обращений не найдена", ephemeral=True)
             return
-        if any(owner(channel, TICKET_PREFIX) == interaction.user.id for channel in category.text_channels):
+        open_tickets = [channel for channel in category.text_channels if owner(channel, TICKET_PREFIX) == interaction.user.id]
+        has_appeal = any((channel.topic or "").partition(";")[2] == "appeal" for channel in open_tickets)
+        if (self.kind == "appeal" and has_appeal) or (self.kind != "appeal" and open_tickets):
             await interaction.response.send_message("У вас уже есть открытое обращение", ephemeral=True)
+            return
+        if mod_roles["mute"] in interaction.user.roles and self.kind != "appeal":
+            await interaction.response.send_message("Во время мута можно создать только обращение «Обжаловать наказание»", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            mod_roles["mute"]: discord.PermissionOverwrite(
+                send_messages=False,
+                send_messages_in_threads=False,
+                add_reactions=False,
+                speak=False,
+            ),
             interaction.user: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -1143,6 +1533,441 @@ class TicketControls(discord.ui.View):
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if await staff(interaction):
             await show_modal(interaction, TicketCloseForm(self.user_id))
+
+
+# ============================================================
+# МОДЕРАЦИЯ
+# ============================================================
+
+
+def audit_reason(action: str, moderator: discord.abc.User | None, reason: str) -> str:
+    moderator_name = str(moderator) if moderator else "Система"
+    return f"{action} | {moderator_name} | {reason}"[:512]
+
+
+def history_line(row: sqlite3.Row) -> str:
+    labels = {
+        "ban": "Бан",
+        "unban": "Разбан",
+        "mute": "Мут",
+        "unmute": "Размут",
+        "warn": "Предупреждение",
+        "unwarn": "Снятие предупреждения",
+    }
+    moderator = f"<@{row['moderator_id']}>" if row["moderator_id"] else "Система"
+    reason = discord.utils.escape_markdown(str(row["reason"]))[:500]
+    expiry = f"; до <t:{row['expires_at']}:f>" if row["expires_at"] else ""
+    status = "; активно" if row["active"] else ""
+    return f"<t:{row['created_at']}:f> — **{labels.get(row['kind'], row['kind'])}**{expiry}{status}\n{reason} · {moderator}"
+
+
+async def find_ban(guild: discord.Guild, value: str) -> discord.BanEntry | None:
+    cleaned = value.strip()
+    if cleaned.isdigit():
+        try:
+            return await guild.fetch_ban(discord.Object(id=int(cleaned)))
+        except discord.NotFound:
+            return None
+    lowered = cleaned.casefold()
+    async for entry in guild.bans(limit=None):
+        names = {entry.user.name.casefold(), str(entry.user).casefold()}
+        if entry.user.global_name:
+            names.add(entry.user.global_name.casefold())
+        if lowered in names:
+            return entry
+    return None
+
+
+async def banned_user_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return []
+    roles = await bot.roles(interaction.guild)
+    if not (interaction.user.guild_permissions.administrator or roles[2] in interaction.user.roles or roles[3] in interaction.user.roles):
+        return []
+    choices: list[app_commands.Choice[str]] = []
+    try:
+        async for entry in interaction.guild.bans(limit=100):
+            user = entry.user
+            label = user.global_name or user.name
+            searchable = f"{label} {user.name} {user.id}".casefold()
+            if current.casefold() in searchable:
+                choices.append(app_commands.Choice(name=f"{label} ({user.name})"[:100], value=str(user.id)))
+                if len(choices) == 25:
+                    break
+    except discord.HTTPException:
+        return []
+    return choices
+
+
+@bot.tree.command(name="бан", description="Навсегда заблокировать пользователя на сервере")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина блокировки")
+async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    notice_sent = await dm(member, punishment_embed("Вы заблокированы на сервере", interaction.user, reason, appeal=True))
+    try:
+        await interaction.guild.ban(member, reason=audit_reason("Бан", interaction.user, reason), delete_message_seconds=0)
+    except discord.Forbidden:
+        await interaction.followup.send("Боту не хватает прав, чтобы заблокировать этого пользователя", ephemeral=True)
+        return
+    except discord.HTTPException:
+        logging.exception("Не удалось заблокировать пользователя %s", member.id)
+        await interaction.followup.send("Discord не принял блокировку. Попробуйте ещё раз", ephemeral=True)
+        return
+    bot.store.add_punishment(interaction.guild.id, member.id, "ban", interaction.user.id, reason, active=True)
+    await log_punishment(interaction.guild, "Пользователь заблокирован", member, interaction.user, reason, duration="Навсегда")
+    suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
+    await interaction.followup.send(f"{member} заблокирован навсегда{suffix}", ephemeral=True)
+
+
+@bot.tree.command(name="разбан", description="Снять блокировку с пользователя")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(target="ник", reason="причина")
+@app_commands.describe(target="Выберите заблокированного пользователя", reason="Причина снятия блокировки")
+@app_commands.autocomplete(target=banned_user_autocomplete)
+async def unban_member(interaction: discord.Interaction, target: str, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        entry = await find_ban(interaction.guild, target)
+    except discord.Forbidden:
+        await interaction.followup.send("Боту не хватает права просматривать список блокировок", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.followup.send("Не удалось получить список блокировок. Попробуйте ещё раз", ephemeral=True)
+        return
+    if entry is None:
+        await interaction.followup.send("Пользователь не найден в списке заблокированных", ephemeral=True)
+        return
+    try:
+        await interaction.guild.unban(entry.user, reason=audit_reason("Разбан", interaction.user, reason))
+    except discord.Forbidden:
+        await interaction.followup.send("Боту не хватает прав для снятия блокировки", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.followup.send("Discord не принял снятие блокировки. Попробуйте ещё раз", ephemeral=True)
+        return
+    bot.store.deactivate_all(interaction.guild.id, entry.user.id, "ban")
+    bot.store.add_punishment(interaction.guild.id, entry.user.id, "unban", interaction.user.id, reason)
+    await log_punishment(interaction.guild, "Пользователь разблокирован", entry.user, interaction.user, reason, colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+    await interaction.followup.send(f"Блокировка с {entry.user} снята", ephemeral=True)
+
+
+@bot.tree.command(name="мут", description="Запретить пользователю писать и говорить")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", duration="время", reason="причина")
+@app_commands.describe(member="Пользователь", duration="Например: 30м, 12ч или 3д", reason="Причина мута")
+async def mute_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: app_commands.Range[str, 2, 16],
+    reason: app_commands.Range[str, 1, 1000],
+) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    parsed = parse_duration(duration)
+    if parsed is None:
+        await interaction.response.send_message("Укажите время в формате `30м`, `12ч` или `3д` (не более 10 лет)", ephemeral=True)
+        return
+    seconds, duration_label = parsed
+    await interaction.response.defer(ephemeral=True)
+    roles = await moderation_roles(interaction.guild)
+    async with bot.moderation_lock:
+        if roles["mute"] in member.roles or bot.store.active_count(interaction.guild.id, member.id, "mute"):
+            await interaction.followup.send("У пользователя уже есть активный мут", ephemeral=True)
+            return
+        try:
+            await member.add_roles(roles["mute"], reason=audit_reason("Мут", interaction.user, reason))
+        except discord.Forbidden:
+            await interaction.followup.send("Боту не хватает прав, чтобы выдать роль мута", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось выдать роль мута пользователю %s", member.id)
+            await interaction.followup.send("Discord не принял выдачу роли мута. Попробуйте ещё раз", ephemeral=True)
+            return
+        expires_at = int((datetime.now(timezone.utc) + timedelta(seconds=seconds)).timestamp())
+        bot.store.add_punishment(interaction.guild.id, member.id, "mute", interaction.user.id, reason, expires_at=expires_at, active=True)
+        permission_failures = await apply_member_mute_overwrites(member)
+    notice_sent = await dm(member, punishment_embed("Вам выдан мут", interaction.user, reason, duration=f"{duration_label} (до <t:{expires_at}:f>)"))
+    await log_punishment(interaction.guild, "Пользователю выдан мут", member, interaction.user, reason, duration=f"до <t:{expires_at}:f>")
+    suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
+    if permission_failures:
+        suffix += f". Не удалось обновить права в каналах: {permission_failures}"
+    await interaction.followup.send(f"{member.mention} получил мут до <t:{expires_at}:f>{suffix}", ephemeral=True)
+
+
+@bot.tree.command(name="размут", description="Снять мут с пользователя")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина снятия мута")
+async def unmute_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    roles = await moderation_roles(interaction.guild)
+    async with bot.moderation_lock:
+        active = bot.store.active_punishments(interaction.guild.id, member.id, "mute")
+        if not active and roles["mute"] not in member.roles:
+            await interaction.followup.send("У пользователя нет активного мута", ephemeral=True)
+            return
+        permission_failures = await restore_member_mute_overwrites(member)
+        if permission_failures:
+            await apply_member_mute_overwrites(member)
+            await interaction.followup.send(
+                f"Не удалось восстановить права пользователя в каналах: {permission_failures}. Попробуйте ещё раз",
+                ephemeral=True,
+            )
+            return
+        try:
+            if roles["mute"] in member.roles:
+                await member.remove_roles(roles["mute"], reason=audit_reason("Размут", interaction.user, reason))
+        except discord.Forbidden:
+            await apply_member_mute_overwrites(member)
+            await interaction.followup.send("Боту не хватает прав, чтобы снять роль мута", ephemeral=True)
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось снять роль мута с пользователя %s", member.id)
+            await apply_member_mute_overwrites(member)
+            await interaction.followup.send("Discord не принял снятие роли мута. Попробуйте ещё раз", ephemeral=True)
+            return
+        bot.store.deactivate_all(interaction.guild.id, member.id, "mute")
+        bot.store.add_punishment(interaction.guild.id, member.id, "unmute", interaction.user.id, reason)
+    await log_punishment(interaction.guild, "С пользователя снят мут", member, interaction.user, reason, colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+    await interaction.followup.send(f"Мут с {member.mention} снят", ephemeral=True)
+
+
+@bot.tree.command(name="пред", description="Выдать пользователю предупреждение")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина предупреждения")
+async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    roles = await moderation_roles(interaction.guild)
+    now = int(datetime.now(timezone.utc).timestamp())
+    expires_at = now + WARNING_LIFETIME_SECONDS
+    automatic_ban_key = (interaction.guild.id, member.id)
+    async with bot.moderation_lock:
+        if automatic_ban_key in bot.automatic_bans:
+            await interaction.followup.send("Для пользователя уже выполняется автоматическая блокировка", ephemeral=True)
+            return
+        punishment_id = bot.store.add_punishment(
+            interaction.guild.id,
+            member.id,
+            "warn",
+            interaction.user.id,
+            reason,
+            expires_at=expires_at,
+            active=True,
+            created_at=now,
+        )
+        try:
+            warning_count = await sync_warning_roles(member, roles)
+        except discord.HTTPException:
+            bot.store.deactivate(punishment_id)
+            await interaction.followup.send("Боту не хватает прав, чтобы выдать роль предупреждения", ephemeral=True)
+            return
+        if warning_count >= 3:
+            bot.automatic_bans.add(automatic_ban_key)
+    notice_sent = await dm(
+        member,
+        punishment_embed(
+            "Вам выдано предупреждение",
+            interaction.user,
+            reason,
+            duration=f"до <t:{expires_at}:f>",
+            extra=f"**Активных предупреждений:** {warning_count}/3",
+        ),
+    )
+    await log_punishment(
+        interaction.guild,
+        "Пользователю выдано предупреждение",
+        member,
+        interaction.user,
+        reason,
+        duration=f"до <t:{expires_at}:f> · {warning_count}/3",
+        colour_html=GOLD_EMBED_COLOR_HTML,
+    )
+    if warning_count < 3:
+        suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
+        await interaction.followup.send(f"{member.mention} получил предупреждение ({warning_count}/3){suffix}", ephemeral=True)
+        return
+
+    automatic_reason = "Получено 3 предупреждения"
+    ban_expires_at = now + AUTOMATIC_BAN_SECONDS
+    clear_reason = "Предупреждения сняты после автоматического бана"
+    ban_succeeded = False
+    try:
+        await dm(member, punishment_embed("Вы заблокированы на сервере", None, automatic_reason, duration=f"1 день (до <t:{ban_expires_at}:f>)", appeal=True))
+        await interaction.guild.ban(member, reason=audit_reason("Автоматический бан", None, automatic_reason), delete_message_seconds=0)
+        ban_succeeded = True
+    except discord.Forbidden:
+        await interaction.followup.send("Предупреждение выдано, но боту не хватило прав для автоматического бана", ephemeral=True)
+        return
+    except discord.HTTPException:
+        logging.exception("Не удалось автоматически заблокировать пользователя %s", member.id)
+        await interaction.followup.send("Предупреждение выдано, но Discord не принял автоматический бан", ephemeral=True)
+        return
+    finally:
+        async with bot.moderation_lock:
+            if ban_succeeded:
+                bot.store.add_punishment(interaction.guild.id, member.id, "ban", None, automatic_reason, expires_at=ban_expires_at, active=True, created_at=now)
+                bot.store.deactivate_all(interaction.guild.id, member.id, "warn")
+                bot.store.add_punishment(interaction.guild.id, member.id, "unwarn", None, clear_reason, created_at=now)
+            bot.automatic_bans.discard(automatic_ban_key)
+    await log_punishment(interaction.guild, "Предупреждения сняты", member, None, clear_reason, colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+    await log_punishment(interaction.guild, "Пользователь автоматически заблокирован", member, None, automatic_reason, duration=f"до <t:{ban_expires_at}:f>")
+    await interaction.followup.send(f"{member} получил третье предупреждение и заблокирован на сутки", ephemeral=True)
+
+
+@bot.tree.command(name="разпред", description="Снять последнее активное предупреждение")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина снятия предупреждения")
+async def unwarn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    roles = await moderation_roles(interaction.guild)
+    async with bot.moderation_lock:
+        removed = bot.store.deactivate_latest_warning(interaction.guild.id, member.id)
+        if removed is None:
+            await interaction.followup.send("У пользователя нет активных предупреждений", ephemeral=True)
+            return
+        try:
+            warning_count = await sync_warning_roles(member, roles)
+        except discord.HTTPException:
+            logging.exception("Не удалось обновить роль предупреждения пользователя %s", member.id)
+            warning_count = bot.store.active_count(interaction.guild.id, member.id, "warn")
+        bot.store.add_punishment(interaction.guild.id, member.id, "unwarn", interaction.user.id, reason)
+    await log_punishment(interaction.guild, "С пользователя снято предупреждение", member, interaction.user, reason, colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+    await interaction.followup.send(f"Предупреждение снято. Активных предупреждений: {warning_count}/3", ephemeral=True)
+
+
+@bot.tree.command(name="история", description="Показать историю наказаний пользователя за последний месяц")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(user="ник")
+@app_commands.describe(user="Пользователь")
+async def punishment_history(interaction: discord.Interaction, user: discord.User) -> None:
+    if not await staff(interaction) or not interaction.guild:
+        return
+    await interaction.response.defer(ephemeral=True)
+    now = int(datetime.now(timezone.utc).timestamp())
+    active_mutes = bot.store.active_punishments(interaction.guild.id, user.id, "mute")
+    warning_count = bot.store.active_count(interaction.guild.id, user.id, "warn")
+    current: list[str] = []
+    if active_mutes:
+        expiry = active_mutes[-1]["expires_at"]
+        current.append(f"Мут до <t:{expiry}:f>" if expiry else "Мут")
+    if warning_count:
+        current.append(f"Предупреждений: {warning_count}/3")
+    rows = bot.store.punishment_history(interaction.guild.id, user.id, now - PUNISHMENT_HISTORY_SECONDS)
+    lines: list[str] = []
+    total_length = 0
+    for row in rows:
+        line = history_line(row)
+        if total_length + len(line) + 2 > 3900:
+            lines.append("…Остальные записи не поместились в сообщение")
+            break
+        lines.append(line)
+        total_length += len(line) + 2
+    current_text = "\n".join(current) if current else "Нет"
+    history_text = "\n\n".join(lines) if lines else "За последний месяц наказаний не найдено"
+    embed = discord.Embed(
+        title=f"История наказаний • {user.display_name}",
+        description=f"**Актуальные наказания**\n{current_text}",
+        colour=colour(LOG_EMBED_COLOR_HTML),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    history_parts = [history_text[index:index + 1024] for index in range(0, len(history_text), 1024)]
+    for index, part in enumerate(history_parts):
+        field_name = "История за последние 30 дней" if index == 0 else f"Продолжение {index + 1}"
+        embed.add_field(name=field_name, value=part, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def process_expired_punishments(guild: discord.Guild, roles: dict[str, discord.Role] | None = None) -> None:
+    roles = roles or await moderation_roles(guild)
+    now = int(datetime.now(timezone.utc).timestamp())
+    for row in bot.store.expired_punishments(guild.id, now):
+        kind = str(row["kind"])
+        member = guild.get_member(int(row["user_id"]))
+        user: discord.abc.User | None = member
+        if user is None:
+            try:
+                user = await bot.fetch_user(int(row["user_id"]))
+            except discord.HTTPException:
+                pass
+
+        if kind == "ban":
+            try:
+                entry = await guild.fetch_ban(discord.Object(id=int(row["user_id"])))
+                await guild.unban(entry.user, reason=audit_reason("Автоматический разбан", None, "Истёк срок наказания"))
+                user = entry.user
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                logging.exception("Не удалось автоматически снять бан с пользователя %s", row["user_id"])
+                continue
+            bot.store.deactivate(int(row["id"]))
+            bot.store.add_punishment(guild.id, int(row["user_id"]), "unban", None, "Истёк срок наказания", created_at=now)
+            if user:
+                await log_punishment(guild, "Блокировка автоматически снята", user, None, "Истёк срок наказания", colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+            continue
+
+        if kind == "mute":
+            if member is not None:
+                permission_failures = await restore_member_mute_overwrites(member)
+                if permission_failures:
+                    await apply_member_mute_overwrites(member)
+                    continue
+                try:
+                    if roles["mute"] in member.roles:
+                        await member.remove_roles(roles["mute"], reason=audit_reason("Автоматический размут", None, "Истёк срок наказания"))
+                except discord.HTTPException:
+                    await apply_member_mute_overwrites(member)
+                    logging.exception("Не удалось автоматически снять мут с пользователя %s", row["user_id"])
+                    continue
+            bot.store.deactivate(int(row["id"]))
+            bot.store.add_punishment(guild.id, int(row["user_id"]), "unmute", None, "Истёк срок наказания", created_at=now)
+            if user:
+                await log_punishment(guild, "Мут автоматически снят", user, None, "Истёк срок наказания", colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+            continue
+
+        if kind == "warn":
+            bot.store.deactivate(int(row["id"]))
+            if member is not None:
+                try:
+                    await sync_warning_roles(member, roles)
+                except discord.HTTPException:
+                    bot.store.activate(int(row["id"]))
+                    logging.exception("Не удалось обновить роль предупреждений пользователя %s", row["user_id"])
+                    continue
+            bot.store.add_punishment(guild.id, int(row["user_id"]), "unwarn", None, "Истёк срок давности", created_at=now)
+            if user:
+                await log_punishment(guild, "Предупреждение автоматически снято", user, None, "Истёк срок давности", colour_html=APPLICATION_ACCEPTED_COLOR_HTML)
+    bot.store.purge_old_punishments(now - PUNISHMENT_HISTORY_SECONDS)
+
+
+@tasks.loop(minutes=1)
+async def punishment_expiry_loop() -> None:
+    for guild in bot.guilds:
+        async with bot.moderation_lock:
+            try:
+                await process_expired_punishments(guild)
+            except Exception:
+                logging.exception("Не удалось проверить сроки наказаний на сервере %s", guild.id)
+
+
+@punishment_expiry_loop.before_loop
+async def before_punishment_expiry_loop() -> None:
+    await bot.wait_until_ready()
 
 
 # ============================================================
@@ -1367,6 +2192,26 @@ async def on_member_join(member: discord.Member) -> None:
     if bot.store.first_join(member.guild.id, member.id):
         guest, _, _, _ = await bot.roles(member.guild)
         await member.add_roles(guest, reason="Первый вход на сервер")
+    roles = await moderation_roles(member.guild)
+    try:
+        await restore_member_punishments(member, roles)
+    except discord.HTTPException:
+        logging.exception("Не удалось восстановить наказания пользователя %s после входа", member.id)
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
+    if channel.guild.id != GUILD_ID:
+        return
+    try:
+        roles = await moderation_roles(channel.guild)
+        await apply_mute_overwrite(channel, roles["mute"])
+        for user_id in bot.store.active_user_ids(channel.guild.id, "mute"):
+            member = channel.guild.get_member(user_id)
+            if member is not None:
+                await apply_member_mute_overwrite(channel, member)
+    except discord.HTTPException:
+        logging.exception("Не удалось настроить роль мута в новом канале %s", channel.id)
 
 
 @bot.event
