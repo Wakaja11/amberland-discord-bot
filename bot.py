@@ -96,6 +96,9 @@ class Store:
             "CREATE TABLE IF NOT EXISTS members (guild_id INTEGER, user_id INTEGER, PRIMARY KEY(guild_id,user_id));"
             "CREATE TABLE IF NOT EXISTS voices (voice_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, closed INTEGER NOT NULL DEFAULT 0);"
             "CREATE TABLE IF NOT EXISTS applications (channel_id INTEGER PRIMARY KEY, nickname TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS player_links ("
+            "guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, nickname TEXT NOT NULL COLLATE NOCASE, "
+            "PRIMARY KEY(guild_id,user_id), UNIQUE(guild_id,nickname));"
             "CREATE TABLE IF NOT EXISTS punishments ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
             "kind TEXT NOT NULL, moderator_id INTEGER, reason TEXT NOT NULL, created_at INTEGER NOT NULL, "
@@ -133,6 +136,28 @@ class Store:
     def remove_application(self, channel_id: int) -> None:
         self.db.execute("DELETE FROM applications WHERE channel_id=?", (channel_id,))
         self.db.commit()
+
+    def set_player_nickname(self, guild_id: int, user_id: int, nickname: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO player_links(guild_id,user_id,nickname) VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET nickname=excluded.nickname",
+                (guild_id, user_id, nickname),
+            )
+
+    def player_nickname(self, guild_id: int, user_id: int) -> str | None:
+        row = self.db.execute(
+            "SELECT nickname FROM player_links WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def player_for_nickname(self, guild_id: int, nickname: str) -> int | None:
+        row = self.db.execute(
+            "SELECT user_id FROM player_links WHERE guild_id=? AND nickname=? COLLATE NOCASE",
+            (guild_id, nickname),
+        ).fetchone()
+        return int(row[0]) if row else None
 
     def add_voice(self, voice_id: int, owner_id: int) -> None:
         self.db.execute("INSERT OR REPLACE INTO voices VALUES(?,?,0)", (voice_id, owner_id))
@@ -1305,6 +1330,13 @@ class ApplicationDecision(discord.ui.View):
         if not nickname:
             await interaction.followup.send("Не удалось найти никнейм из заявки", ephemeral=True)
             return
+        linked_user_id = bot.store.player_for_nickname(interaction.guild.id, nickname)
+        if linked_user_id is not None and linked_user_id != applicant.id:
+            await interaction.followup.send(
+                "Этот Minecraft-ник уже привязан к другому пользователю. Проверьте заявку перед одобрением",
+                ephemeral=True,
+            )
+            return
         details = await application_details(interaction.channel)
         details["Пользователь"] = applicant.mention
         details.setdefault("Никнейм", nickname)
@@ -1313,8 +1345,34 @@ class ApplicationDecision(discord.ui.View):
         except RconError as error:
             await interaction.followup.send(f"Не удалось добавить игрока в белый список: {error}", ephemeral=True)
             return
-        await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
-        await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
+        try:
+            await applicant.edit(nick=nickname, reason=f"Заявка одобрена {interaction.user}")
+            await applicant.add_roles(roles[1], reason=f"Заявка одобрена {interaction.user}")
+            await applicant.remove_roles(roles[0], reason=f"Заявка одобрена {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Игрок добавлен в белый список, но бот не смог изменить его ник или роли. "
+                "Проверьте право «Управлять никнеймами» и положение роли бота, затем нажмите «Принять» ещё раз",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            logging.exception("Не удалось изменить ник или роли пользователя %s при одобрении заявки", applicant.id)
+            await interaction.followup.send(
+                "Игрок добавлен в белый список, но Discord не принял изменение ника или ролей. Попробуйте ещё раз",
+                ephemeral=True,
+            )
+            return
+        try:
+            bot.store.set_player_nickname(interaction.guild.id, applicant.id, nickname)
+        except sqlite3.IntegrityError:
+            logging.exception("Не удалось сохранить привязку Minecraft-ника %s", nickname)
+            await interaction.followup.send(
+                "Ник и роли изменены, но этот Minecraft-ник уже оказался привязан к другому пользователю. "
+                "Заявка оставлена открытой для проверки",
+                ephemeral=True,
+            )
+            return
         await dm(applicant, discord.Embed(title="Заявка принята", description=f"Заявку принял: {interaction.user.mention}\nДобро пожаловать на сервер! Приятной игры", colour=colour(APPLICATION_ACCEPTED_COLOR_HTML)))
         await interaction.channel.edit(topic=f"{APP_PREFIX}{self.user_id};accepted", reason=f"Заявка одобрена {interaction.user}")
         if interaction.message:
