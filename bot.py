@@ -784,8 +784,8 @@ def safe_rcon_reason(reason: str) -> str:
     return cleaned[:500] or "Причина не указана"
 
 
-def player_nickname(guild_id: int, user_id: int) -> str | None:
-    nickname = bot.store.player_nickname(guild_id, user_id)
+def server_minecraft_nickname(member: discord.Member) -> str | None:
+    nickname = member.nick
     if nickname and re.fullmatch(r"[A-Za-z0-9_]{3,16}", nickname):
         return nickname
     return None
@@ -794,11 +794,11 @@ def player_nickname(guild_id: int, user_id: int) -> str | None:
 async def require_player_nickname(interaction: discord.Interaction, member: discord.Member) -> str | None:
     if not interaction.guild:
         return None
-    nickname = player_nickname(interaction.guild.id, member.id)
+    nickname = server_minecraft_nickname(member)
     if nickname is None:
         message = (
-            "У пользователя нет привязанного Minecraft-ника. "
-            "Привязка создаётся при одобрении заявки игрока"
+            "У пользователя не установлен корректный никнейм Minecraft на этом Discord-сервере. "
+            "Серверный ник должен состоять из 3–16 латинских букв, цифр или символов `_`"
         )
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
@@ -2080,7 +2080,7 @@ async def process_expired_punishments(guild: discord.Guild, roles: dict[str, dis
                 user = await bot.fetch_user(int(row["user_id"]))
             except discord.HTTPException:
                 pass
-        nickname = player_nickname(guild.id, int(row["user_id"]))
+        nickname = server_minecraft_nickname(member) if member is not None else None
 
         if kind == "ban":
             if nickname is None:
