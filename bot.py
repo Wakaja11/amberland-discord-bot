@@ -312,14 +312,6 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else None
 
-    def assign_ticket(self, channel_id: int, assignee_id: int) -> None:
-        self.db.execute(
-            "INSERT INTO ticket_assignments(channel_id,assignee_id) VALUES(?,?) "
-            "ON CONFLICT(channel_id) DO UPDATE SET assignee_id=excluded.assignee_id",
-            (channel_id, assignee_id),
-        )
-        self.db.commit()
-
     def remove_ticket_assignment(self, channel_id: int) -> None:
         self.db.execute("DELETE FROM ticket_assignments WHERE channel_id=?", (channel_id,))
         self.db.commit()
@@ -533,7 +525,6 @@ class Bot(commands.Bot):
         self.started = False
         self.interaction_ids: set[int] = set()
         self.moderation_lock = asyncio.Lock()
-        self.ticket_lock = asyncio.Lock()
         self.statistics_lock = asyncio.Lock()
         self.daily_summary_lock = asyncio.Lock()
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
@@ -976,7 +967,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Обращения и тикеты",
-            "**Взять тикет** — назначить себя ответственным. После этого остальные хелперы могут только читать тикет, а назначенный хелпер и администраторы — писать.\n**Передать тикет** — выбрать другого хелпера или администратора.\n`/добавить` — открыть выбранному игроку доступ к текущему тикету.\n**Закрыть обращение** — указать итоговое решение и удалить тикет.",
+            "Хелперы и администраторы могут читать и вести открытые тикеты.\n`/добавить` — открыть выбранному игроку доступ к текущему тикету.\n**Закрыть обращение** — указать итоговое решение и удалить тикет.",
         ),
         (
             "Наказания",
@@ -988,7 +979,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Права модераторов",
-            "Хелперы могут наказывать игроков, но не хелперов и администраторов. Администраторы могут наказывать хелперов и переназначать уже взятые тикеты. Ботов, владельца сервера и самого себя наказать нельзя.",
+            "Хелперы могут наказывать игроков, но не хелперов и администраторов. Администраторы могут наказывать хелперов. Ботов, владельца сервера и самого себя наказать нельзя.",
         ),
         (
             "Временные войсы и статистика",
@@ -1134,10 +1125,18 @@ async def restore(guild: discord.Guild) -> None:
                         except discord.HTTPException:
                             logging.exception("Не удалось обновить права автора обращения %s", channel.id)
                 try:
-                    await apply_ticket_assignment_permissions(channel)
+                    await restore_shared_ticket_permissions(channel)
                 except discord.HTTPException:
-                    logging.exception("Не удалось восстановить назначение тикета %s", channel.id)
-                bot.add_view(TicketControls(user_id))
+                    logging.exception("Не удалось восстановить общие права модераторов в тикете %s", channel.id)
+                controls = TicketControls(user_id)
+                bot.add_view(controls)
+                try:
+                    async for message in channel.history(limit=1000, oldest_first=True):
+                        if message.author == bot.user and any(embed.title == ticket_topic(channel) for embed in message.embeds):
+                            await message.edit(view=TicketControls(user_id))
+                            break
+                except discord.HTTPException:
+                    logging.exception("Не удалось убрать старые кнопки управления тикетом %s", channel.id)
     for voice_id, user_id, closed in bot.store.voices():
         voice = guild.get_channel(voice_id)
         if isinstance(voice, discord.VoiceChannel):
@@ -1801,38 +1800,30 @@ def ticket_topic(channel: discord.TextChannel) -> str:
     return FORMS.get(kind, ("Не указано", ()))[0]
 
 
-def is_ticket_admin(member: discord.Member, roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role]) -> bool:
-    return member.guild_permissions.administrator or roles[3] in member.roles
-
-
-def is_ticket_staff(member: discord.Member, roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role]) -> bool:
-    return is_ticket_admin(member, roles) or roles[2] in member.roles
-
-
-def can_manage_ticket(
-    member: discord.Member,
-    channel: discord.TextChannel,
-    roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role],
-) -> bool:
-    assignee_id = bot.store.ticket_assignee(channel.id)
-    return assignee_id is None or member.id == assignee_id or is_ticket_admin(member, roles)
-
-
-async def apply_ticket_assignment_permissions(channel: discord.TextChannel) -> None:
+async def restore_shared_ticket_permissions(channel: discord.TextChannel) -> None:
     roles = await bot.roles(channel.guild)
     assignee_id = bot.store.ticket_assignee(channel.id)
+    assignee = channel.guild.get_member(assignee_id) if assignee_id else None
+    if assignee is not None and assignee.id != owner(channel, TICKET_PREFIX):
+        await channel.set_permissions(
+            assignee,
+            overwrite=None,
+            reason="Удаление персональных прав прежнего ответственного за тикет",
+        )
+
     helper_overwrite = channel.overwrites_for(roles[2])
     helper_overwrite.view_channel = True
     helper_overwrite.read_message_history = True
-    helper_overwrite.send_messages = assignee_id is None
-    helper_overwrite.send_messages_in_threads = assignee_id is None
-    helper_overwrite.add_reactions = assignee_id is None
-    helper_overwrite.use_application_commands = assignee_id is None
-    helper_overwrite.manage_messages = assignee_id is None
+    helper_overwrite.send_messages = True
+    helper_overwrite.send_messages_in_threads = True
+    helper_overwrite.attach_files = True
+    helper_overwrite.add_reactions = True
+    helper_overwrite.use_application_commands = True
+    helper_overwrite.manage_messages = True
     await channel.set_permissions(
         roles[2],
         overwrite=helper_overwrite,
-        reason="Обновление доступа хелперов к тикету",
+        reason="Общий доступ хелперов к тикету",
     )
 
     admin_overwrite = channel.overwrites_for(roles[3])
@@ -1840,6 +1831,7 @@ async def apply_ticket_assignment_permissions(channel: discord.TextChannel) -> N
     admin_overwrite.read_message_history = True
     admin_overwrite.send_messages = True
     admin_overwrite.send_messages_in_threads = True
+    admin_overwrite.attach_files = True
     admin_overwrite.add_reactions = True
     admin_overwrite.use_application_commands = True
     admin_overwrite.manage_messages = True
@@ -1848,105 +1840,7 @@ async def apply_ticket_assignment_permissions(channel: discord.TextChannel) -> N
         overwrite=admin_overwrite,
         reason="Постоянный доступ администраторов к тикету",
     )
-
-    if assignee_id is not None:
-        assignee = channel.guild.get_member(assignee_id)
-        if assignee is not None:
-            assignee_overwrite = channel.overwrites_for(assignee)
-            assignee_overwrite.view_channel = True
-            assignee_overwrite.read_message_history = True
-            assignee_overwrite.send_messages = True
-            assignee_overwrite.send_messages_in_threads = True
-            assignee_overwrite.attach_files = True
-            assignee_overwrite.add_reactions = True
-            assignee_overwrite.use_application_commands = True
-            assignee_overwrite.manage_messages = True
-            await channel.set_permissions(
-                assignee,
-                overwrite=assignee_overwrite,
-                reason="Доступ ответственного модератора к тикету",
-            )
-
-
-async def assign_ticket_to(
-    channel: discord.TextChannel,
-    assignee: discord.Member,
-) -> None:
-    previous_id = bot.store.ticket_assignee(channel.id)
-    previous = channel.guild.get_member(previous_id) if previous_id else None
-    ticket_owner_id = owner(channel, TICKET_PREFIX)
-    if previous is not None and previous.id != assignee.id and previous.id != ticket_owner_id:
-        await channel.set_permissions(previous, overwrite=None, reason="Передача тикета другому модератору")
-    bot.store.assign_ticket(channel.id, assignee.id)
-    try:
-        await apply_ticket_assignment_permissions(channel)
-    except discord.HTTPException:
-        if previous_id is None:
-            bot.store.remove_ticket_assignment(channel.id)
-        else:
-            bot.store.assign_ticket(channel.id, previous_id)
-        try:
-            await apply_ticket_assignment_permissions(channel)
-        except discord.HTTPException:
-            logging.exception("Не удалось восстановить прежние права тикета %s", channel.id)
-        raise
-    if previous is None:
-        text = f"Тикет взят модератором {assignee.mention}"
-    else:
-        text = f"Тикет передан от {previous.mention} к {assignee.mention}"
-        if previous.id == assignee.id:
-            text = f"Ответственный за тикет — {assignee.mention}"
-    await channel.send(
-        text,
-        allowed_mentions=discord.AllowedMentions(users=True),
-    )
-
-
-class TicketTransferSelect(discord.ui.UserSelect):
-    def __init__(self, channel_id: int, actor_id: int) -> None:
-        super().__init__(placeholder="Выберите нового ответственного", min_values=1, max_values=1)
-        self.channel_id = channel_id
-        self.actor_id = actor_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Передать тикет можно только на сервере", ephemeral=True)
-            return
-        channel = interaction.guild.get_channel(self.channel_id)
-        target = self.values[0]
-        if not isinstance(channel, discord.TextChannel) or not isinstance(target, discord.Member) or not is_ticket(channel):
-            await interaction.response.send_message("Тикет или пользователь больше не доступны", ephemeral=True)
-            return
-        roles = await bot.roles(interaction.guild)
-        current_id = bot.store.ticket_assignee(channel.id)
-        if interaction.user.id != self.actor_id or (interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles)):
-            await interaction.response.send_message("Передать тикет может ответственный модератор или администратор", ephemeral=True)
-            return
-        if not is_ticket_staff(target, roles) or target.bot:
-            await interaction.response.send_message("Ответственным можно назначить только хелпера или администратора", ephemeral=True)
-            return
-        if target.id == current_id:
-            await interaction.response.send_message("Этот модератор уже отвечает за тикет", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        async with bot.ticket_lock:
-            current_id = bot.store.ticket_assignee(channel.id)
-            if interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles):
-                await interaction.followup.send("Ответственный за тикет уже изменился", ephemeral=True)
-                return
-            try:
-                await assign_ticket_to(channel, target)
-            except discord.HTTPException:
-                logging.exception("Не удалось передать тикет %s", channel.id)
-                await interaction.followup.send("Не удалось обновить права тикета", ephemeral=True)
-                return
-        await interaction.followup.send(f"Тикет передан пользователю {target.mention}", ephemeral=True)
-
-
-class TicketTransferView(discord.ui.View):
-    def __init__(self, channel_id: int, actor_id: int) -> None:
-        super().__init__(timeout=120)
-        self.add_item(TicketTransferSelect(channel_id, actor_id))
+    bot.store.remove_ticket_assignment(channel.id)
 
 
 @bot.tree.command(name="добавить", description="Добавить пользователя в текущее обращение")
@@ -1957,9 +1851,6 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
     if not roles or not interaction.guild or not is_ticket(interaction.channel):
         if roles:
             await interaction.response.send_message("Команду можно использовать только в канале обращения", ephemeral=True)
-        return
-    if not isinstance(interaction.user, discord.Member) or not can_manage_ticket(interaction.user, interaction.channel, roles):
-        await interaction.response.send_message("Управлять этим тикетом может ответственный модератор или администратор", ephemeral=True)
         return
     await interaction.response.defer()
     await interaction.channel.set_permissions(
@@ -1984,11 +1875,7 @@ class TicketCloseForm(discord.ui.Modal, title="Закрытие обращени
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        roles = await staff(interaction)
-        if not roles or not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
-            return
-        if not can_manage_ticket(interaction.user, interaction.channel, roles):
-            await interaction.response.send_message("Закрыть тикет может ответственный модератор или администратор", ephemeral=True)
+        if not await staff(interaction) or not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
             return
         await interaction.response.send_message("Обращение будет удалено через несколько секунд", ephemeral=True)
         await delete_ticket(interaction.channel, "Обращение закрыто модератором", {
@@ -2003,59 +1890,8 @@ class TicketControls(discord.ui.View):
     def __init__(self, user_id: int) -> None:
         super().__init__(timeout=None)
         self.user_id = user_id
-        self.take.custom_id = f"ticket:take:{user_id}"
-        self.transfer.custom_id = f"ticket:transfer:{user_id}"
         self.resolved.custom_id = f"ticket:resolved:{user_id}"
         self.close.custom_id = f"ticket:close:{user_id}"
-
-    @discord.ui.button(label="Взять тикет", style=discord.ButtonStyle.primary)
-    async def take(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel) or not is_ticket(interaction.channel):
-            await interaction.response.send_message("Кнопка доступна только в открытом тикете", ephemeral=True)
-            return
-        roles = await bot.roles(interaction.guild)
-        if not is_ticket_staff(interaction.user, roles):
-            await interaction.response.send_message("Взять тикет могут только хелперы и администраторы", ephemeral=True)
-            return
-        current_id = bot.store.ticket_assignee(interaction.channel.id)
-        if current_id == interaction.user.id:
-            await interaction.response.send_message("Вы уже отвечаете за этот тикет", ephemeral=True)
-            return
-        if current_id is not None and not is_ticket_admin(interaction.user, roles):
-            await interaction.response.send_message("Тикет уже взят другим модератором", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        async with bot.ticket_lock:
-            current_id = bot.store.ticket_assignee(interaction.channel.id)
-            if current_id is not None and not is_ticket_admin(interaction.user, roles):
-                await interaction.followup.send("Тикет уже взят другим модератором", ephemeral=True)
-                return
-            try:
-                await assign_ticket_to(interaction.channel, interaction.user)
-            except discord.HTTPException:
-                logging.exception("Не удалось назначить ответственного за тикет %s", interaction.channel.id)
-                await interaction.followup.send("Не удалось обновить права тикета", ephemeral=True)
-                return
-        await interaction.followup.send("Вы назначены ответственным за тикет", ephemeral=True)
-
-    @discord.ui.button(label="Передать тикет", style=discord.ButtonStyle.secondary)
-    async def transfer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel) or not is_ticket(interaction.channel):
-            await interaction.response.send_message("Кнопка доступна только в открытом тикете", ephemeral=True)
-            return
-        roles = await bot.roles(interaction.guild)
-        current_id = bot.store.ticket_assignee(interaction.channel.id)
-        if current_id is None:
-            await interaction.response.send_message("Сначала тикет должен взять один из модераторов", ephemeral=True)
-            return
-        if interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles):
-            await interaction.response.send_message("Передать тикет может ответственный модератор или администратор", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "Выберите нового ответственного:",
-            view=TicketTransferView(interaction.channel.id, interaction.user.id),
-            ephemeral=True,
-        )
 
     @discord.ui.button(label="Проблема решена", style=discord.ButtonStyle.success)
     async def resolved(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -2074,13 +1910,8 @@ class TicketControls(discord.ui.View):
 
     @discord.ui.button(label="Закрыть обращение", style=discord.ButtonStyle.primary)
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        roles = await staff(interaction)
-        if not roles or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
-            return
-        if not can_manage_ticket(interaction.user, interaction.channel, roles):
-            await interaction.response.send_message("Закрыть тикет может ответственный модератор или администратор", ephemeral=True)
-            return
-        await show_modal(interaction, TicketCloseForm(self.user_id))
+        if await staff(interaction):
+            await show_modal(interaction, TicketCloseForm(self.user_id))
 
 
 # ============================================================
