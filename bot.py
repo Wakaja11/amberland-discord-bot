@@ -595,7 +595,6 @@ class Bot(commands.Bot):
                 await setup_moderation(guild)
                 await panels(guild)
                 await restore(guild)
-                await ensure_daily_summary(guild)
                 logging.info("Бот запущен: сервер %s, панели и кнопки проверены.", guild.name)
             except Exception:
                 logging.exception("Ошибка настройки сервера %s", guild.id)
