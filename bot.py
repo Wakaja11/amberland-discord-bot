@@ -2104,7 +2104,7 @@ async def punishment_history(interaction: discord.Interaction, user: discord.Use
                 embed.add_field(name=name, value=value, inline=False)
         elif page_index == 0:
             embed.add_field(name="История за последние 30 дней", value="Наказаний не найдено", inline=False)
-        footer = f"Страница {page_index + 1}/{len(row_pages)} · сначала новые записи"
+        footer = f"Страница {page_index + 1}/{len(row_pages)}"
         if len(rows) > len(displayed_rows) and page_index == len(row_pages) - 1:
             footer += f" · показано {len(displayed_rows)} из {len(rows)}"
         embed.set_footer(text=footer)
