@@ -813,7 +813,7 @@ def capitalized_field_value(value: str) -> str:
 
 
 def punishment_period(started_at: int, expires_at: int) -> str:
-    return f"Начало: <t:{started_at}:f>\nКонец: <t:{expires_at}:f>"
+    return f"<t:{started_at}:f> — <t:{expires_at}:f>"
 
 
 def punishment_embed(
