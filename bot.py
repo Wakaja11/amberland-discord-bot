@@ -812,6 +812,10 @@ def capitalized_field_value(value: str) -> str:
     return cleaned[:1].upper() + cleaned[1:] if cleaned else "Не указано"
 
 
+def punishment_period(started_at: int, expires_at: int) -> str:
+    return f"Начало: <t:{started_at}:f>\nКонец: <t:{expires_at}:f>"
+
+
 def punishment_embed(
     title: str,
     moderator: discord.Member | None,
@@ -843,6 +847,7 @@ async def log_punishment(
     *,
     duration: str | None = None,
     colour_html: str = APPLICATION_REJECTED_COLOR_HTML,
+    extra_fields: dict[str, object] | None = None,
 ) -> None:
     fields: dict[str, object] = {
         "Пользователь": f"{user.mention} ({user})",
@@ -851,6 +856,7 @@ async def log_punishment(
     }
     if duration:
         fields["Срок"] = capitalized_field_value(duration)
+    fields.update(extra_fields or {})
     await bot.log(
         guild,
         action,
@@ -1681,11 +1687,7 @@ def history_entry(row: sqlite3.Row, number: int) -> tuple[str, str]:
     title = f"{number}. {labels.get(kind, kind)} • <t:{row['created_at']}:f>"
     details = [f"**Причина:** {reason}", f"**Модератор:** {moderator}"]
     if row["expires_at"]:
-        details.append(f"**Срок:** С <t:{row['created_at']}:f> по <t:{row['expires_at']}:f>")
-    if kind in {"ban", "mute", "warn"}:
-        details.append(f"**Статус:** {'Активно' if row['active'] else 'Завершено'}")
-    else:
-        details.append("**Статус:** Выполнено")
+        details.append(f"**Срок:**\n{punishment_period(int(row['created_at']), int(row['expires_at']))}")
     return title[:256], "\n".join(details)[:1024]
 
 
@@ -1787,12 +1789,12 @@ async def mute_member(
     if parsed is None:
         await interaction.response.send_message("Укажите время в формате `30м`, `12ч` или `3д` (не более 10 лет)", ephemeral=True)
         return
-    seconds, duration_label, rcon_duration = parsed
+    seconds, _, rcon_duration = parsed
     await interaction.response.defer(ephemeral=True)
     roles = await moderation_roles(interaction.guild)
     started_at = int(datetime.now(timezone.utc).timestamp())
     expires_at = started_at + seconds
-    duration_period = f"С <t:{started_at}:f> по <t:{expires_at}:f>"
+    duration_period = punishment_period(started_at, expires_at)
     async with bot.moderation_lock:
         if roles["mute"] in member.roles or bot.store.active_count(interaction.guild.id, member.id, "mute"):
             await interaction.followup.send("У пользователя уже есть активный мут", ephemeral=True)
@@ -1833,7 +1835,7 @@ async def mute_member(
         )
     notice_sent = await dm(
         member,
-        punishment_embed("Вам выдан мут", interaction.user, reason, duration=f"{duration_period} ({duration_label})"),
+        punishment_embed("Вам выдан мут", interaction.user, reason, duration=duration_period),
     )
     await log_punishment(interaction.guild, "Пользователю выдан мут", member, interaction.user, reason, duration=duration_period)
     suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
@@ -1909,7 +1911,7 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     roles = await moderation_roles(interaction.guild)
     now = int(datetime.now(timezone.utc).timestamp())
     expires_at = now + WARNING_LIFETIME_SECONDS
-    warning_period = f"С <t:{now}:f> по <t:{expires_at}:f>"
+    warning_period = punishment_period(now, expires_at)
     automatic_ban_key = (interaction.guild.id, member.id)
     async with bot.moderation_lock:
         if automatic_ban_key in bot.automatic_bans:
@@ -1967,8 +1969,9 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
         member,
         interaction.user,
         reason,
-        duration=f"{warning_period} · {warning_count}/3",
+        duration=warning_period,
         colour_html=GOLD_EMBED_COLOR_HTML,
+        extra_fields={"Предупреждений": f"{warning_count}/3"},
     )
     if warning_count < 3:
         suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
@@ -2065,11 +2068,19 @@ async def punishment_history(interaction: discord.Interaction, user: discord.Use
     warning_count = bot.store.active_count(interaction.guild.id, user.id, "warn")
     current: list[str] = []
     if active_bans:
-        expiry = active_bans[-1]["expires_at"]
-        current.append(f"Бан до <t:{expiry}:f>" if expiry else "Перманентный бан")
+        active_ban = active_bans[-1]
+        expiry = active_ban["expires_at"]
+        current.append(
+            f"Бан\n{punishment_period(int(active_ban['created_at']), int(expiry))}"
+            if expiry else "Перманентный бан"
+        )
     if active_mutes:
-        expiry = active_mutes[-1]["expires_at"]
-        current.append(f"Мут до <t:{expiry}:f>" if expiry else "Мут")
+        active_mute = active_mutes[-1]
+        expiry = active_mute["expires_at"]
+        current.append(
+            f"Мут\n{punishment_period(int(active_mute['created_at']), int(expiry))}"
+            if expiry else "Мут"
+        )
     if warning_count:
         current.append(f"Предупреждений: {warning_count}/3")
     rows = bot.store.punishment_history(interaction.guild.id, user.id, now - PUNISHMENT_HISTORY_SECONDS)
