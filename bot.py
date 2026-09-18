@@ -6,7 +6,9 @@ import os
 import re
 import sqlite3
 import struct
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -39,6 +41,8 @@ APPLICATION_CATEGORY_ID = 1500023409952686190
 TICKET_CATEGORY_ID = 1485653736335605841
 SPAM_PROTECTION_CHANNEL_ID = 1485655876193882363
 LOG_CHANNEL_ID = 1486338493029548094
+DOCUMENTATION_CHANNEL_ID = 1550499602040487996
+DOCUMENTATION_MESSAGE_ID = 1550502972847558701
 VOICE_CREATOR_CHANNEL_ID = 1498318412080746556
 VOICE_CATEGORY_ID = 1485288483881746623
 GUEST_ROLE_ID = 1485642937860620518
@@ -53,7 +57,9 @@ BAN_ROLE_ID = 1519084712210071552
 STATISTICS_IP_NAME = "IP: amberland.pro"
 STATISTICS_MEMBERS_PREFIX = "Участников:"
 STATISTICS_PLAYERS_PREFIX = "Игроков:"
+STATISTICS_ONLINE_PREFIX = "Онлайн:"
 STATISTICS_UPDATE_DELAY_SECONDS = 30
+MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 GOLD_EMBED_COLOR_HTML = "#F1C40F"
 APPLICATION_PANEL_COLOR_HTML = GOLD_EMBED_COLOR_HTML
@@ -120,6 +126,11 @@ class Store:
             "guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
             "allow_value TEXT NOT NULL, deny_value TEXT NOT NULL, "
             "PRIMARY KEY(guild_id,user_id,channel_id));"
+            "CREATE TABLE IF NOT EXISTS ticket_assignments ("
+            "channel_id INTEGER PRIMARY KEY, assignee_id INTEGER NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS daily_metrics ("
+            "day TEXT NOT NULL, key TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY(day,key));"
         )
         self.db.commit()
 
@@ -294,6 +305,52 @@ class Store:
         self.db.execute("DELETE FROM punishments WHERE active=0 AND created_at<?", (before,))
         self.db.commit()
 
+    def ticket_assignee(self, channel_id: int) -> int | None:
+        row = self.db.execute(
+            "SELECT assignee_id FROM ticket_assignments WHERE channel_id=?",
+            (channel_id,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def assign_ticket(self, channel_id: int, assignee_id: int) -> None:
+        self.db.execute(
+            "INSERT INTO ticket_assignments(channel_id,assignee_id) VALUES(?,?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET assignee_id=excluded.assignee_id",
+            (channel_id, assignee_id),
+        )
+        self.db.commit()
+
+    def remove_ticket_assignment(self, channel_id: int) -> None:
+        self.db.execute("DELETE FROM ticket_assignments WHERE channel_id=?", (channel_id,))
+        self.db.commit()
+
+    def increment_daily_metric(self, key: str, amount: int = 1, *, day: date | None = None) -> None:
+        metric_day = (day or datetime.now(MOSCOW_TIMEZONE).date()).isoformat()
+        self.db.execute(
+            "INSERT INTO daily_metrics(day,key,value) VALUES(?,?,?) "
+            "ON CONFLICT(day,key) DO UPDATE SET value=value+excluded.value",
+            (metric_day, key, amount),
+        )
+        self.db.commit()
+
+    def update_daily_maximum(self, key: str, value: int, *, day: date | None = None) -> None:
+        metric_day = (day or datetime.now(MOSCOW_TIMEZONE).date()).isoformat()
+        self.db.execute(
+            "INSERT INTO daily_metrics(day,key,value) VALUES(?,?,?) "
+            "ON CONFLICT(day,key) DO UPDATE SET value=MAX(value,excluded.value)",
+            (metric_day, key, value),
+        )
+        self.db.commit()
+
+    def daily_metrics(self, day: date) -> dict[str, int]:
+        return {
+            str(row[0]): int(row[1])
+            for row in self.db.execute(
+                "SELECT key,value FROM daily_metrics WHERE day=?",
+                (day.isoformat(),),
+            )
+        }
+
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -393,6 +450,7 @@ async def read_rcon_packet(reader: asyncio.StreamReader) -> tuple[int, int, str]
 async def rcon_command(command: str) -> str:
     if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
         logging.warning("RCON: команда не выполнена — подключение не настроено")
+        bot.store.increment_daily_metric("rcon_errors")
         raise RconError("RCON не настроен")
 
     writer: asyncio.StreamWriter | None = None
@@ -435,15 +493,19 @@ async def rcon_command(command: str) -> str:
         logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
         return response
     except RconError:
+        bot.store.increment_daily_metric("rcon_errors")
         raise
     except TimeoutError as error:
         logging.warning("RCON: сервер не ответил за %s секунд", RCON_TIMEOUT_SECONDS)
+        bot.store.increment_daily_metric("rcon_errors")
         raise RconError("RCON не ответил вовремя") from error
     except ConnectionRefusedError as error:
         logging.warning("RCON: сервер отклонил подключение")
+        bot.store.increment_daily_metric("rcon_errors")
         raise RconError("RCON отклонил подключение") from error
     except (OSError, asyncio.IncompleteReadError, struct.error) as error:
         logging.exception("RCON: не удалось выполнить команду")
+        bot.store.increment_daily_metric("rcon_errors")
         raise RconError("Не удалось выполнить команду RCON") from error
     finally:
         if writer is not None:
@@ -471,7 +533,9 @@ class Bot(commands.Bot):
         self.started = False
         self.interaction_ids: set[int] = set()
         self.moderation_lock = asyncio.Lock()
+        self.ticket_lock = asyncio.Lock()
         self.statistics_lock = asyncio.Lock()
+        self.daily_summary_lock = asyncio.Lock()
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.automatic_bans: set[tuple[int, int]] = set()
 
@@ -526,6 +590,8 @@ class Bot(commands.Bot):
             punishment_expiry_loop.start()
         if not statistics_refresh_loop.is_running():
             statistics_refresh_loop.start()
+        if not daily_summary_loop.is_running():
+            daily_summary_loop.start()
 
     async def on_ready(self) -> None:
         if self.started:
@@ -533,10 +599,12 @@ class Bot(commands.Bot):
         self.started = True
         for guild in self.guilds:
             try:
+                await update_moderator_documentation(guild)
                 await self.roles(guild)
                 await setup_moderation(guild)
                 await panels(guild)
                 await restore(guild)
+                await ensure_daily_summary(guild)
                 logging.info("Бот запущен: сервер %s, панели и кнопки проверены.", guild.name)
             except Exception:
                 logging.exception("Ошибка настройки сервера %s", guild.id)
@@ -900,6 +968,136 @@ async def panels(guild: discord.Guild) -> None:
         await spam.set_permissions(guild.default_role, view_channel=True, send_messages=True, reason="Настройка антиспама")
 
 
+def moderator_documentation_embeds() -> list[discord.Embed]:
+    sections = (
+        (
+            "Заявки игроков",
+            "В канале заявки используйте кнопки **Принять** и **Отклонить**. При принятии бот добавляет игрока в белый список, выдаёт роль игрока и устанавливает серверный ник из заявки. Отклонение требует указать причину.",
+        ),
+        (
+            "Обращения и тикеты",
+            "**Взять тикет** — назначить себя ответственным. После этого остальные хелперы могут только читать тикет, а назначенный хелпер и администраторы — писать.\n**Передать тикет** — выбрать другого хелпера или администратора.\n`/добавить` — открыть выбранному игроку доступ к текущему тикету.\n**Закрыть обращение** — указать итоговое решение и удалить тикет.",
+        ),
+        (
+            "Наказания",
+            "`/бан ник причина` — бессрочный бан на Minecraft-сервере; перед выполнением требуется подтверждение.\n`/разбан ник причина` — снять бан.\n`/мут ник время причина` — выдать мут.\n`/размут ник причина` — снять мут.\n`/пред ник причина` — выдать предупреждение; перед третьим требуется подтверждение.\n`/разпред ник причина` — снять последнее активное предупреждение.\n`/история ник` — показать действия за последний месяц и актуальные наказания.",
+        ),
+        (
+            "Формат указания времени",
+            "Используйте число и букву без пробела: `30м`, `12ч`, `3д`. Предупреждение действует 3 дня. Третье активное предупреждение приводит к бессрочному бану на Minecraft-сервере.",
+        ),
+        (
+            "Права модераторов",
+            "Хелперы могут наказывать игроков, но не хелперов и администраторов. Администраторы могут наказывать хелперов и переназначать уже взятые тикеты. Ботов, владельца сервера и самого себя наказать нельзя.",
+        ),
+        (
+            "Временные войсы и статистика",
+            "После входа в канал создания войса игрок получает собственный канал и панель управления. Создатель войса может менять название, лимит, закрывать канал и управлять доступом. Голосовые каналы статистики показывают IP, число участников, игроков с ролью и онлайн Minecraft. Подключение к ним закрыто.",
+        ),
+        (
+            "Ежедневная сводка",
+            "Каждый день в 00:00 по московскому времени в канале логов публикуется сводка за прошедший день. Предыдущая сводка удаляется автоматически.",
+        ),
+    )
+    return [
+        discord.Embed(title=title, description=description, colour=colour(GOLD_EMBED_COLOR_HTML))
+        for title, description in sections
+    ]
+
+
+async def update_moderator_documentation(guild: discord.Guild) -> None:
+    channel = guild.get_channel(DOCUMENTATION_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logging.warning("Канал документации %s не найден", DOCUMENTATION_CHANNEL_ID)
+        return
+    message_id = bot.store.get(f"documentation:{guild.id}") or DOCUMENTATION_MESSAGE_ID
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(content=None, embeds=moderator_documentation_embeds(), view=None)
+    except discord.NotFound:
+        message = await channel.send(embeds=moderator_documentation_embeds())
+    except discord.Forbidden:
+        logging.warning("Не удалось изменить прежнее сообщение документации, создаётся новое")
+        message = await channel.send(embeds=moderator_documentation_embeds())
+    bot.store.set(f"documentation:{guild.id}", message.id)
+
+
+async def daily_log_actions(guild: discord.Guild, summary_day: date) -> Counter[str]:
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return Counter()
+    start = datetime.combine(summary_day, time.min, tzinfo=MOSCOW_TIMEZONE).astimezone(timezone.utc)
+    end = (datetime.combine(summary_day, time.min, tzinfo=MOSCOW_TIMEZONE) + timedelta(days=1)).astimezone(timezone.utc)
+    actions: Counter[str] = Counter()
+    async for message in channel.history(limit=None, after=start, before=end, oldest_first=True):
+        for embed in message.embeds:
+            if embed.title and embed.title.startswith("Лог • "):
+                actions[embed.title.removeprefix("Лог • ")] += 1
+    return actions
+
+
+async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None:
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logging.warning("Канал логов для ежедневной сводки не найден")
+        return
+    actions = await daily_log_actions(guild, summary_day)
+    metrics = bot.store.daily_metrics(summary_day)
+    accepted = actions["Заявка принята"]
+    rejected = actions["Заявка отклонена"]
+    event_accepted = actions["Ивент одобрен"]
+    event_rejected = actions["Заявка на ивент отклонена"]
+    tickets_closed = actions["Обращение закрыто модератором"] + actions["Проблема решена игроком"]
+    punishment_lines = (
+        f"Баны: **{actions['Пользователь заблокирован'] + actions['Пользователь автоматически заблокирован']}** · снято: **{actions['Пользователь разблокирован']}**\n"
+        f"Муты: **{actions['Пользователю выдан мут']}** · снято: **{actions['С пользователя снят мут'] + actions['Мут автоматически снят']}**\n"
+        f"Предупреждения: **{actions['Пользователю выдано предупреждение']}** · снято: **{actions['С пользователя снято предупреждение'] + actions['Предупреждение автоматически снято']}**"
+    )
+    embed = discord.Embed(
+        title=f"Сводка за {summary_day.strftime('%d.%m.%Y')}",
+        colour=colour(GOLD_EMBED_COLOR_HTML),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Участники", value=f"Новых: **{metrics.get('new_members', 0)}**\nПиковый онлайн Minecraft: **{metrics.get('peak_online', 0)}**", inline=False)
+    embed.add_field(name="Заявки", value=f"Принято: **{accepted}** · отклонено: **{rejected}**\nИвенты: **{event_accepted}** одобрено · **{event_rejected}** отклонено", inline=False)
+    embed.add_field(name="Тикеты", value=f"Закрыто: **{tickets_closed}**", inline=False)
+    embed.add_field(name="Наказания", value=punishment_lines, inline=False)
+    embed.add_field(name="Ошибки связи с Minecraft", value=f"**{metrics.get('rcon_errors', 0)}**", inline=False)
+    new_message = await channel.send(embed=embed)
+
+    previous_id = bot.store.get(f"daily_summary_message:{guild.id}")
+    if previous_id and previous_id != new_message.id:
+        try:
+            await (await channel.fetch_message(previous_id)).delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+    bot.store.set(f"daily_summary_message:{guild.id}", new_message.id)
+    bot.store.set(f"daily_summary_date:{guild.id}", int(summary_day.strftime("%Y%m%d")))
+
+
+async def ensure_daily_summary(guild: discord.Guild) -> None:
+    async with bot.daily_summary_lock:
+        summary_day = datetime.now(MOSCOW_TIMEZONE).date() - timedelta(days=1)
+        summary_key = int(summary_day.strftime("%Y%m%d"))
+        if bot.store.get(f"daily_summary_date:{guild.id}") == summary_key:
+            return
+        await publish_daily_summary(guild, summary_day)
+
+
+@tasks.loop(time=time(hour=0, minute=0, tzinfo=MOSCOW_TIMEZONE))
+async def daily_summary_loop() -> None:
+    for guild in bot.guilds:
+        try:
+            await ensure_daily_summary(guild)
+        except Exception:
+            logging.exception("Не удалось опубликовать ежедневную сводку сервера %s", guild.id)
+
+
+@daily_summary_loop.before_loop
+async def before_daily_summary_loop() -> None:
+    await bot.wait_until_ready()
+
+
 async def restore(guild: discord.Guild) -> None:
     for key, view in (("application", ApplicationPanel()), ("help", HelpPanel())):
         message_id = bot.store.get(f"{key}:{guild.id}")
@@ -935,6 +1133,10 @@ async def restore(guild: discord.Guild) -> None:
                             )
                         except discord.HTTPException:
                             logging.exception("Не удалось обновить права автора обращения %s", channel.id)
+                try:
+                    await apply_ticket_assignment_permissions(channel)
+                except discord.HTTPException:
+                    logging.exception("Не удалось восстановить назначение тикета %s", channel.id)
                 bot.add_view(TicketControls(user_id))
     for voice_id, user_id, closed in bot.store.voices():
         voice = guild.get_channel(voice_id)
@@ -1599,6 +1801,154 @@ def ticket_topic(channel: discord.TextChannel) -> str:
     return FORMS.get(kind, ("Не указано", ()))[0]
 
 
+def is_ticket_admin(member: discord.Member, roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role]) -> bool:
+    return member.guild_permissions.administrator or roles[3] in member.roles
+
+
+def is_ticket_staff(member: discord.Member, roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role]) -> bool:
+    return is_ticket_admin(member, roles) or roles[2] in member.roles
+
+
+def can_manage_ticket(
+    member: discord.Member,
+    channel: discord.TextChannel,
+    roles: tuple[discord.Role, discord.Role, discord.Role, discord.Role],
+) -> bool:
+    assignee_id = bot.store.ticket_assignee(channel.id)
+    return assignee_id is None or member.id == assignee_id or is_ticket_admin(member, roles)
+
+
+async def apply_ticket_assignment_permissions(channel: discord.TextChannel) -> None:
+    roles = await bot.roles(channel.guild)
+    assignee_id = bot.store.ticket_assignee(channel.id)
+    helper_overwrite = channel.overwrites_for(roles[2])
+    helper_overwrite.view_channel = True
+    helper_overwrite.read_message_history = True
+    helper_overwrite.send_messages = assignee_id is None
+    helper_overwrite.send_messages_in_threads = assignee_id is None
+    helper_overwrite.add_reactions = assignee_id is None
+    helper_overwrite.use_application_commands = assignee_id is None
+    helper_overwrite.manage_messages = assignee_id is None
+    await channel.set_permissions(
+        roles[2],
+        overwrite=helper_overwrite,
+        reason="Обновление доступа хелперов к тикету",
+    )
+
+    admin_overwrite = channel.overwrites_for(roles[3])
+    admin_overwrite.view_channel = True
+    admin_overwrite.read_message_history = True
+    admin_overwrite.send_messages = True
+    admin_overwrite.send_messages_in_threads = True
+    admin_overwrite.add_reactions = True
+    admin_overwrite.use_application_commands = True
+    admin_overwrite.manage_messages = True
+    await channel.set_permissions(
+        roles[3],
+        overwrite=admin_overwrite,
+        reason="Постоянный доступ администраторов к тикету",
+    )
+
+    if assignee_id is not None:
+        assignee = channel.guild.get_member(assignee_id)
+        if assignee is not None:
+            assignee_overwrite = channel.overwrites_for(assignee)
+            assignee_overwrite.view_channel = True
+            assignee_overwrite.read_message_history = True
+            assignee_overwrite.send_messages = True
+            assignee_overwrite.send_messages_in_threads = True
+            assignee_overwrite.attach_files = True
+            assignee_overwrite.add_reactions = True
+            assignee_overwrite.use_application_commands = True
+            assignee_overwrite.manage_messages = True
+            await channel.set_permissions(
+                assignee,
+                overwrite=assignee_overwrite,
+                reason="Доступ ответственного модератора к тикету",
+            )
+
+
+async def assign_ticket_to(
+    channel: discord.TextChannel,
+    assignee: discord.Member,
+) -> None:
+    previous_id = bot.store.ticket_assignee(channel.id)
+    previous = channel.guild.get_member(previous_id) if previous_id else None
+    ticket_owner_id = owner(channel, TICKET_PREFIX)
+    if previous is not None and previous.id != assignee.id and previous.id != ticket_owner_id:
+        await channel.set_permissions(previous, overwrite=None, reason="Передача тикета другому модератору")
+    bot.store.assign_ticket(channel.id, assignee.id)
+    try:
+        await apply_ticket_assignment_permissions(channel)
+    except discord.HTTPException:
+        if previous_id is None:
+            bot.store.remove_ticket_assignment(channel.id)
+        else:
+            bot.store.assign_ticket(channel.id, previous_id)
+        try:
+            await apply_ticket_assignment_permissions(channel)
+        except discord.HTTPException:
+            logging.exception("Не удалось восстановить прежние права тикета %s", channel.id)
+        raise
+    if previous is None:
+        text = f"Тикет взят модератором {assignee.mention}"
+    else:
+        text = f"Тикет передан от {previous.mention} к {assignee.mention}"
+        if previous.id == assignee.id:
+            text = f"Ответственный за тикет — {assignee.mention}"
+    await channel.send(
+        text,
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+
+
+class TicketTransferSelect(discord.ui.UserSelect):
+    def __init__(self, channel_id: int, actor_id: int) -> None:
+        super().__init__(placeholder="Выберите нового ответственного", min_values=1, max_values=1)
+        self.channel_id = channel_id
+        self.actor_id = actor_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Передать тикет можно только на сервере", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(self.channel_id)
+        target = self.values[0]
+        if not isinstance(channel, discord.TextChannel) or not isinstance(target, discord.Member) or not is_ticket(channel):
+            await interaction.response.send_message("Тикет или пользователь больше не доступны", ephemeral=True)
+            return
+        roles = await bot.roles(interaction.guild)
+        current_id = bot.store.ticket_assignee(channel.id)
+        if interaction.user.id != self.actor_id or (interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles)):
+            await interaction.response.send_message("Передать тикет может ответственный модератор или администратор", ephemeral=True)
+            return
+        if not is_ticket_staff(target, roles) or target.bot:
+            await interaction.response.send_message("Ответственным можно назначить только хелпера или администратора", ephemeral=True)
+            return
+        if target.id == current_id:
+            await interaction.response.send_message("Этот модератор уже отвечает за тикет", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with bot.ticket_lock:
+            current_id = bot.store.ticket_assignee(channel.id)
+            if interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles):
+                await interaction.followup.send("Ответственный за тикет уже изменился", ephemeral=True)
+                return
+            try:
+                await assign_ticket_to(channel, target)
+            except discord.HTTPException:
+                logging.exception("Не удалось передать тикет %s", channel.id)
+                await interaction.followup.send("Не удалось обновить права тикета", ephemeral=True)
+                return
+        await interaction.followup.send(f"Тикет передан пользователю {target.mention}", ephemeral=True)
+
+
+class TicketTransferView(discord.ui.View):
+    def __init__(self, channel_id: int, actor_id: int) -> None:
+        super().__init__(timeout=120)
+        self.add_item(TicketTransferSelect(channel_id, actor_id))
+
+
 @bot.tree.command(name="добавить", description="Добавить пользователя в текущее обращение")
 @app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(user="Пользователь, которому нужно открыть доступ")
@@ -1607,6 +1957,9 @@ async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) 
     if not roles or not interaction.guild or not is_ticket(interaction.channel):
         if roles:
             await interaction.response.send_message("Команду можно использовать только в канале обращения", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not can_manage_ticket(interaction.user, interaction.channel, roles):
+        await interaction.response.send_message("Управлять этим тикетом может ответственный модератор или администратор", ephemeral=True)
         return
     await interaction.response.defer()
     await interaction.channel.set_permissions(
@@ -1631,7 +1984,11 @@ class TicketCloseForm(discord.ui.Modal, title="Закрытие обращени
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await staff(interaction) or not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
+        roles = await staff(interaction)
+        if not roles or not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
+            return
+        if not can_manage_ticket(interaction.user, interaction.channel, roles):
+            await interaction.response.send_message("Закрыть тикет может ответственный модератор или администратор", ephemeral=True)
             return
         await interaction.response.send_message("Обращение будет удалено через несколько секунд", ephemeral=True)
         await delete_ticket(interaction.channel, "Обращение закрыто модератором", {
@@ -1646,8 +2003,59 @@ class TicketControls(discord.ui.View):
     def __init__(self, user_id: int) -> None:
         super().__init__(timeout=None)
         self.user_id = user_id
+        self.take.custom_id = f"ticket:take:{user_id}"
+        self.transfer.custom_id = f"ticket:transfer:{user_id}"
         self.resolved.custom_id = f"ticket:resolved:{user_id}"
         self.close.custom_id = f"ticket:close:{user_id}"
+
+    @discord.ui.button(label="Взять тикет", style=discord.ButtonStyle.primary)
+    async def take(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel) or not is_ticket(interaction.channel):
+            await interaction.response.send_message("Кнопка доступна только в открытом тикете", ephemeral=True)
+            return
+        roles = await bot.roles(interaction.guild)
+        if not is_ticket_staff(interaction.user, roles):
+            await interaction.response.send_message("Взять тикет могут только хелперы и администраторы", ephemeral=True)
+            return
+        current_id = bot.store.ticket_assignee(interaction.channel.id)
+        if current_id == interaction.user.id:
+            await interaction.response.send_message("Вы уже отвечаете за этот тикет", ephemeral=True)
+            return
+        if current_id is not None and not is_ticket_admin(interaction.user, roles):
+            await interaction.response.send_message("Тикет уже взят другим модератором", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with bot.ticket_lock:
+            current_id = bot.store.ticket_assignee(interaction.channel.id)
+            if current_id is not None and not is_ticket_admin(interaction.user, roles):
+                await interaction.followup.send("Тикет уже взят другим модератором", ephemeral=True)
+                return
+            try:
+                await assign_ticket_to(interaction.channel, interaction.user)
+            except discord.HTTPException:
+                logging.exception("Не удалось назначить ответственного за тикет %s", interaction.channel.id)
+                await interaction.followup.send("Не удалось обновить права тикета", ephemeral=True)
+                return
+        await interaction.followup.send("Вы назначены ответственным за тикет", ephemeral=True)
+
+    @discord.ui.button(label="Передать тикет", style=discord.ButtonStyle.secondary)
+    async def transfer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel) or not is_ticket(interaction.channel):
+            await interaction.response.send_message("Кнопка доступна только в открытом тикете", ephemeral=True)
+            return
+        roles = await bot.roles(interaction.guild)
+        current_id = bot.store.ticket_assignee(interaction.channel.id)
+        if current_id is None:
+            await interaction.response.send_message("Сначала тикет должен взять один из модераторов", ephemeral=True)
+            return
+        if interaction.user.id != current_id and not is_ticket_admin(interaction.user, roles):
+            await interaction.response.send_message("Передать тикет может ответственный модератор или администратор", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Выберите нового ответственного:",
+            view=TicketTransferView(interaction.channel.id, interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Проблема решена", style=discord.ButtonStyle.success)
     async def resolved(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1666,8 +2074,13 @@ class TicketControls(discord.ui.View):
 
     @discord.ui.button(label="Закрыть обращение", style=discord.ButtonStyle.primary)
     async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if await staff(interaction):
-            await show_modal(interaction, TicketCloseForm(self.user_id))
+        roles = await staff(interaction)
+        if not roles or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        if not can_manage_ticket(interaction.user, interaction.channel, roles):
+            await interaction.response.send_message("Закрыть тикет может ответственный модератор или администратор", ephemeral=True)
+            return
+        await show_modal(interaction, TicketCloseForm(self.user_id))
 
 
 # ============================================================
@@ -1699,17 +2112,13 @@ def history_entry(row: sqlite3.Row, number: int) -> tuple[str, str]:
     return title[:256], "\n".join(details)[:1024]
 
 
-@bot.tree.command(name="бан", description="Навсегда заблокировать игрока на Minecraft-сервере")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-@app_commands.rename(member="ник", reason="причина")
-@app_commands.describe(member="Пользователь", reason="Причина блокировки")
-async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
-    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+async def perform_ban(interaction: discord.Interaction, member: discord.Member, reason: str) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("Команда доступна только на сервере", ephemeral=True)
         return
     nickname = await require_player_nickname(interaction, member)
     if nickname is None:
         return
-    await interaction.response.defer(ephemeral=True)
     roles = await moderation_roles(interaction.guild)
     if bot.store.active_count(interaction.guild.id, member.id, "ban") or roles["ban"] in member.roles:
         await interaction.followup.send("У пользователя уже есть активный бан", ephemeral=True)
@@ -1737,6 +2146,61 @@ async def ban_member(interaction: discord.Interaction, member: discord.Member, r
     await log_punishment(interaction.guild, "Пользователь заблокирован", member, interaction.user, reason, duration="Навсегда")
     suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
     await interaction.followup.send(f"{member.mention} заблокирован на Minecraft-сервере навсегда{suffix}", ephemeral=True)
+
+
+class BanConfirmation(discord.ui.View):
+    def __init__(self, moderator_id: int, member: discord.Member, reason: str) -> None:
+        super().__init__(timeout=60)
+        self.moderator_id = moderator_id
+        self.member = member
+        self.reason = reason
+
+    @discord.ui.button(label="Подтвердить бан", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Подтвердить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        if not await moderation_target(interaction, self.member):
+            return
+        await interaction.response.edit_message(content="Блокировка выполняется…", embed=None, view=None)
+        await perform_ban(interaction, self.member, self.reason)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Отменить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Блокировка отменена", embed=None, view=None)
+
+
+@bot.tree.command(name="бан", description="Навсегда заблокировать игрока на Minecraft-сервере")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина блокировки")
+async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    nickname = await require_player_nickname(interaction, member)
+    if nickname is None:
+        return
+    roles = await moderation_roles(interaction.guild)
+    if bot.store.active_count(interaction.guild.id, member.id, "ban") or roles["ban"] in member.roles:
+        await interaction.response.send_message("У пользователя уже есть активный бан", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="Подтверждение блокировки",
+        description=(
+            f"**Пользователь:** {member.mention} (`{nickname}`)\n"
+            f"**Причина:** {capitalized_field_value(reason)}\n\n"
+            "Блокировка на Minecraft-сервере будет бессрочной."
+        ),
+        colour=colour(APPLICATION_REJECTED_COLOR_HTML),
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=BanConfirmation(interaction.user.id, member, reason),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="разбан", description="Снять блокировку с пользователя")
@@ -1905,23 +2369,31 @@ async def unmute_member(interaction: discord.Interaction, member: discord.Member
     await interaction.followup.send(f"Мут с {member.mention} снят", ephemeral=True)
 
 
-@bot.tree.command(name="пред", description="Выдать пользователю предупреждение")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-@app_commands.rename(member="ник", reason="причина")
-@app_commands.describe(member="Пользователь", reason="Причина предупреждения")
-async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
-    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+async def perform_warning(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+    *,
+    third_warning_confirmed: bool,
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("Команда доступна только на сервере", ephemeral=True)
         return
     nickname = await require_player_nickname(interaction, member)
     if nickname is None:
         return
-    await interaction.response.defer(ephemeral=True)
     roles = await moderation_roles(interaction.guild)
     now = int(datetime.now(timezone.utc).timestamp())
     expires_at = now + WARNING_LIFETIME_SECONDS
     warning_period = punishment_period(now, expires_at)
     automatic_ban_key = (interaction.guild.id, member.id)
     async with bot.moderation_lock:
+        if bot.store.active_count(interaction.guild.id, member.id, "warn") >= 2 and not third_warning_confirmed:
+            await interaction.followup.send(
+                "За время подтверждения число предупреждений изменилось. Повторите `/пред`, чтобы подтвердить третье предупреждение",
+                ephemeral=True,
+            )
+            return
         if automatic_ban_key in bot.automatic_bans:
             await interaction.followup.send("Для пользователя уже выполняется автоматический бан", ephemeral=True)
             return
@@ -2025,6 +2497,62 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
         f"{member.mention} получил третье предупреждение и навсегда заблокирован на Minecraft-сервере{suffix}",
         ephemeral=True,
     )
+
+
+class ThirdWarningConfirmation(discord.ui.View):
+    def __init__(self, moderator_id: int, member: discord.Member, reason: str) -> None:
+        super().__init__(timeout=60)
+        self.moderator_id = moderator_id
+        self.member = member
+        self.reason = reason
+
+    @discord.ui.button(label="Выдать третье предупреждение", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Подтвердить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        if not await moderation_target(interaction, self.member):
+            return
+        await interaction.response.edit_message(content="Предупреждение выдаётся…", embed=None, view=None)
+        await perform_warning(interaction, self.member, self.reason, third_warning_confirmed=True)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Отменить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Выдача предупреждения отменена", embed=None, view=None)
+
+
+@bot.tree.command(name="пред", description="Выдать пользователю предупреждение")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.rename(member="ник", reason="причина")
+@app_commands.describe(member="Пользователь", reason="Причина предупреждения")
+async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    nickname = await require_player_nickname(interaction, member)
+    if nickname is None:
+        return
+    warning_count = bot.store.active_count(interaction.guild.id, member.id, "warn")
+    if warning_count >= 2:
+        embed = discord.Embed(
+            title="Подтверждение третьего предупреждения",
+            description=(
+                f"**Пользователь:** {member.mention} (`{nickname}`)\n"
+                f"**Причина:** {capitalized_field_value(reason)}\n\n"
+                "После выдачи предупреждения игрок будет бессрочно заблокирован на Minecraft-сервере."
+            ),
+            colour=colour(APPLICATION_REJECTED_COLOR_HTML),
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=ThirdWarningConfirmation(interaction.user.id, member, reason),
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    await perform_warning(interaction, member, reason, third_warning_confirmed=False)
 
 
 @bot.tree.command(name="разпред", description="Снять последнее активное предупреждение")
@@ -2488,6 +3016,26 @@ async def ensure_statistics_channel(
     return channel
 
 
+async def minecraft_online_name() -> str:
+    try:
+        response = await rcon_command("list")
+    except RconError:
+        return f"{STATISTICS_ONLINE_PREFIX} недоступен"
+    patterns = (
+        r"There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online",
+        r"(?:онлайн|online)[^\d]*(\d+)\s*(?:из|/|of)\s*(\d+)",
+        r"\b(\d+)\s*/\s*(\d+)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, response, flags=re.IGNORECASE)
+        if match:
+            online, maximum = map(int, match.groups())
+            bot.store.update_daily_maximum("peak_online", online)
+            return f"{STATISTICS_ONLINE_PREFIX} {online}/{maximum}"
+    logging.warning("Не удалось определить онлайн из ответа Minecraft: %s", response)
+    return f"{STATISTICS_ONLINE_PREFIX} неизвестно"
+
+
 async def update_statistics_channels(guild: discord.Guild) -> None:
     if guild.id != GUILD_ID:
         return
@@ -2501,10 +3049,12 @@ async def update_statistics_channels(guild: discord.Guild) -> None:
         player_role = guild.get_role(PLAYER_ROLE_ID)
         member_count = sum(not member.bot for member in guild.members)
         player_count = sum(not member.bot for member in player_role.members) if player_role else 0
+        online_name = await minecraft_online_name()
         specifications = (
             ("ip", STATISTICS_IP_NAME, ("IP:",)),
             ("members", f"{STATISTICS_MEMBERS_PREFIX} {member_count}", (STATISTICS_MEMBERS_PREFIX, "Участники:")),
             ("players", f"{STATISTICS_PLAYERS_PREFIX} {player_count}", (STATISTICS_PLAYERS_PREFIX,)),
+            ("online", online_name, (STATISTICS_ONLINE_PREFIX,)),
         )
         for statistic, name, prefixes in specifications:
             await ensure_statistics_channel(guild, statistic, name, prefixes)
@@ -2551,9 +3101,12 @@ async def before_statistics_refresh_loop() -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    if bot.store.first_join(member.guild.id, member.id):
+    first_join = bot.store.first_join(member.guild.id, member.id)
+    if first_join:
         guest, _, _, _ = await bot.roles(member.guild)
         await member.add_roles(guest, reason="Первый вход на сервер")
+        if not member.bot:
+            bot.store.increment_daily_metric("new_members")
     roles = await moderation_roles(member.guild)
     try:
         await restore_member_punishments(member, roles)
@@ -2624,6 +3177,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
+    if isinstance(channel, discord.TextChannel):
+        bot.store.remove_ticket_assignment(channel.id)
     if isinstance(channel, discord.VoiceChannel):
         bot.store.remove_voice(channel.id)
         schedule_statistics_update(channel.guild)
@@ -2640,7 +3195,9 @@ async def setup(interaction: discord.Interaction) -> None:
     await bot.roles(interaction.guild)
     await panels(interaction.guild)
     await restore(interaction.guild)
-    await interaction.followup.send("Панели и активные кнопки проверены", ephemeral=True)
+    await update_statistics_channels(interaction.guild)
+    await update_moderator_documentation(interaction.guild)
+    await interaction.followup.send("Панели, каналы статистики, документация и активные кнопки проверены", ephemeral=True)
 
 
 async def main() -> None:
