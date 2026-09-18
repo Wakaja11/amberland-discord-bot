@@ -943,16 +943,13 @@ async def panels(guild: discord.Guild) -> None:
         if not isinstance(channel, discord.TextChannel):
             continue
         message_id = bot.store.get(f"{key}:{guild.id}")
-        if message_id:
-            try:
-                message = await channel.fetch_message(message_id)
-                if view:
-                    await message.edit(embed=embed, view=view)
-                continue
-            except discord.NotFound:
-                pass
         message = await channel.send(embed=embed, view=view)
         bot.store.set(f"{key}:{guild.id}", message.id)
+        if message_id and message_id != message.id:
+            try:
+                await (await channel.fetch_message(message_id)).delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
     spam = guild.get_channel(SPAM_PROTECTION_CHANNEL_ID)
     if isinstance(spam, discord.TextChannel):
         await spam.set_permissions(guild.default_role, view_channel=True, send_messages=True, reason="Настройка антиспама")
@@ -1004,16 +1001,18 @@ async def update_moderator_documentation(guild: discord.Guild) -> None:
     if not isinstance(channel, discord.TextChannel):
         logging.warning("Канал документации %s не найден", DOCUMENTATION_CHANNEL_ID)
         return
-    message_id = bot.store.get(f"documentation:{guild.id}") or DOCUMENTATION_MESSAGE_ID
+    previous_id = bot.store.get(f"documentation:{guild.id}") or DOCUMENTATION_MESSAGE_ID
     try:
-        message = await channel.fetch_message(message_id)
-        await message.edit(content=None, embeds=moderator_documentation_embeds(), view=None)
-    except discord.NotFound:
         message = await channel.send(embeds=moderator_documentation_embeds())
     except discord.Forbidden:
-        logging.warning("Не удалось изменить прежнее сообщение документации, создаётся новое")
-        message = await channel.send(embeds=moderator_documentation_embeds())
+        logging.exception("Боту не хватает прав для публикации документации")
+        return
     bot.store.set(f"documentation:{guild.id}", message.id)
+    if previous_id and previous_id != message.id:
+        try:
+            await (await channel.fetch_message(previous_id)).delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
 
 
 async def daily_log_actions(guild: discord.Guild, summary_day: date) -> Counter[str]:
@@ -1143,7 +1142,20 @@ async def restore(guild: discord.Guild) -> None:
                 try:
                     async for message in channel.history(limit=1000, oldest_first=True):
                         if message.author == bot.user and any(embed.title == ticket_topic(channel) for embed in message.embeds):
-                            await message.edit(view=TicketControls(user_id))
+                            has_removed_buttons = any(
+                                (getattr(component, "custom_id", "") or "").startswith(("ticket:take:", "ticket:transfer:"))
+                                for row in message.components
+                                for component in row.children
+                            )
+                            if has_removed_buttons:
+                                replacement = await channel.send(
+                                    content=message.content or None,
+                                    embeds=message.embeds,
+                                    view=TicketControls(user_id),
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                )
+                                await message.delete()
+                                logging.info("Панель тикета %s перепубликована сообщением %s", channel.id, replacement.id)
                             break
                 except discord.HTTPException:
                     logging.exception("Не удалось убрать старые кнопки управления тикетом %s", channel.id)
