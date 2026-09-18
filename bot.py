@@ -991,7 +991,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Ежедневная сводка",
-            "Каждый день в 00:00 по московскому времени в канале логов публикуется сводка за прошедший день.",
+            "Каждый день в 00:00 по московскому времени в этом канале публикуется сводка за прошедший день.",
         ),
     )
     return [
@@ -1032,9 +1032,9 @@ async def daily_log_actions(guild: discord.Guild, summary_day: date) -> Counter[
 
 
 async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None:
-    channel = guild.get_channel(LOG_CHANNEL_ID)
+    channel = guild.get_channel(DOCUMENTATION_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
-        logging.warning("Канал логов для ежедневной сводки не найден")
+        logging.warning("Канал документации для ежедневной сводки не найден")
         return
     actions = await daily_log_actions(guild, summary_day)
     metrics = bot.store.daily_metrics(summary_day)
@@ -1062,11 +1062,15 @@ async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None
 
     previous_id = bot.store.get(f"daily_summary_message:{guild.id}")
     if previous_id and previous_id != new_message.id:
+        previous_channel_id = bot.store.get(f"daily_summary_channel:{guild.id}") or LOG_CHANNEL_ID
+        previous_channel = guild.get_channel(previous_channel_id)
         try:
-            await (await channel.fetch_message(previous_id)).delete()
+            if isinstance(previous_channel, discord.TextChannel):
+                await (await previous_channel.fetch_message(previous_id)).delete()
         except (discord.NotFound, discord.Forbidden):
             pass
     bot.store.set(f"daily_summary_message:{guild.id}", new_message.id)
+    bot.store.set(f"daily_summary_channel:{guild.id}", channel.id)
     bot.store.set(f"daily_summary_date:{guild.id}", int(summary_day.strftime("%Y%m%d")))
 
 
@@ -1074,7 +1078,10 @@ async def ensure_daily_summary(guild: discord.Guild) -> None:
     async with bot.daily_summary_lock:
         summary_day = datetime.now(MOSCOW_TIMEZONE).date() - timedelta(days=1)
         summary_key = int(summary_day.strftime("%Y%m%d"))
-        if bot.store.get(f"daily_summary_date:{guild.id}") == summary_key:
+        if (
+            bot.store.get(f"daily_summary_date:{guild.id}") == summary_key
+            and bot.store.get(f"daily_summary_channel:{guild.id}") == DOCUMENTATION_CHANNEL_ID
+        ):
             return
         await publish_daily_summary(guild, summary_day)
 
