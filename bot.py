@@ -1666,7 +1666,7 @@ def audit_reason(action: str, moderator: discord.abc.User | None, reason: str) -
     return f"{action} | {moderator_name} | {reason}"[:512]
 
 
-def history_line(row: sqlite3.Row) -> str:
+def history_entry(row: sqlite3.Row, number: int) -> tuple[str, str]:
     labels = {
         "ban": "Бан",
         "unban": "Разбан",
@@ -1675,11 +1675,18 @@ def history_line(row: sqlite3.Row) -> str:
         "warn": "Предупреждение",
         "unwarn": "Снятие предупреждения",
     }
+    kind = str(row["kind"])
     moderator = f"<@{row['moderator_id']}>" if row["moderator_id"] else "Система"
     reason = discord.utils.escape_markdown(capitalized_field_value(str(row["reason"])))[:500]
-    expiry = f"; до <t:{row['expires_at']}:f>" if row["expires_at"] else ""
-    status = "; активно" if row["active"] else ""
-    return f"<t:{row['created_at']}:f> — **{labels.get(row['kind'], row['kind'])}**{expiry}{status}\n{reason} · {moderator}"
+    title = f"{number}. {labels.get(kind, kind)} • <t:{row['created_at']}:f>"
+    details = [f"**Причина:** {reason}", f"**Модератор:** {moderator}"]
+    if row["expires_at"]:
+        details.append(f"**Срок:** С <t:{row['created_at']}:f> по <t:{row['expires_at']}:f>")
+    if kind in {"ban", "mute", "warn"}:
+        details.append(f"**Статус:** {'Активно' if row['active'] else 'Завершено'}")
+    else:
+        details.append("**Статус:** Выполнено")
+    return title[:256], "\n".join(details)[:1024]
 
 
 @bot.tree.command(name="бан", description="Навсегда заблокировать игрока на Minecraft-сервере")
@@ -2066,29 +2073,32 @@ async def punishment_history(interaction: discord.Interaction, user: discord.Use
     if warning_count:
         current.append(f"Предупреждений: {warning_count}/3")
     rows = bot.store.punishment_history(interaction.guild.id, user.id, now - PUNISHMENT_HISTORY_SECONDS)
-    lines: list[str] = []
-    total_length = 0
-    for row in rows:
-        line = history_line(row)
-        if total_length + len(line) + 2 > 3900:
-            lines.append("…Остальные записи не поместились в сообщение")
-            break
-        lines.append(line)
-        total_length += len(line) + 2
-    current_text = "\n".join(current) if current else "Нет"
-    history_text = "\n\n".join(lines) if lines else "За последний месяц наказаний не найдено"
-    embed = discord.Embed(
-        title=f"История наказаний • {user.display_name}",
-        description=f"**Актуальные наказания**\n{current_text}",
-        colour=colour(LOG_EMBED_COLOR_HTML),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_thumbnail(url=user.display_avatar.url)
-    history_parts = [history_text[index:index + 1024] for index in range(0, len(history_text), 1024)]
-    for index, part in enumerate(history_parts):
-        field_name = "История за последние 30 дней" if index == 0 else f"Продолжение {index + 1}"
-        embed.add_field(name=field_name, value=part, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    current_text = "\n".join(f"• {item}" for item in current) if current else "Нет"
+    rows_per_page = 7
+    displayed_rows = rows[:rows_per_page * 10]
+    row_pages = [displayed_rows[index:index + rows_per_page] for index in range(0, len(displayed_rows), rows_per_page)] or [[]]
+    embeds: list[discord.Embed] = []
+    for page_index, page_rows in enumerate(row_pages):
+        embed = discord.Embed(
+            title=f"История наказаний • {user.display_name}" if page_index == 0 else "История наказаний • продолжение",
+            colour=colour(LOG_EMBED_COLOR_HTML),
+            timestamp=datetime.now(timezone.utc) if page_index == 0 else None,
+        )
+        if page_index == 0:
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.add_field(name="Актуальные наказания", value=current_text, inline=False)
+        if page_rows:
+            for offset, row in enumerate(page_rows, start=page_index * rows_per_page + 1):
+                name, value = history_entry(row, offset)
+                embed.add_field(name=name, value=value, inline=False)
+        elif page_index == 0:
+            embed.add_field(name="История за последние 30 дней", value="Наказаний не найдено", inline=False)
+        footer = f"Страница {page_index + 1}/{len(row_pages)} · сначала новые записи"
+        if len(rows) > len(displayed_rows) and page_index == len(row_pages) - 1:
+            footer += f" · показано {len(displayed_rows)} из {len(rows)}"
+        embed.set_footer(text=footer)
+        embeds.append(embed)
+    await interaction.followup.send(embeds=embeds, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def process_expired_punishments(guild: discord.Guild, roles: dict[str, discord.Role] | None = None) -> None:
