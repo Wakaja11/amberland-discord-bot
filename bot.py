@@ -50,6 +50,10 @@ RULES_CHANNEL_ID = 1485511848081227827
 EVENTS_CHANNEL_ID = 1485637955677716683
 EVENTS_ROLE_ID = 1520705428802109621
 BAN_ROLE_ID = 1519084712210071552
+STATISTICS_IP_NAME = "IP: amberland.pro"
+STATISTICS_MEMBERS_PREFIX = "Участников:"
+STATISTICS_PLAYERS_PREFIX = "Игроков:"
+STATISTICS_UPDATE_DELAY_SECONDS = 30
 
 GOLD_EMBED_COLOR_HTML = "#F1C40F"
 APPLICATION_PANEL_COLOR_HTML = GOLD_EMBED_COLOR_HTML
@@ -467,6 +471,8 @@ class Bot(commands.Bot):
         self.started = False
         self.interaction_ids: set[int] = set()
         self.moderation_lock = asyncio.Lock()
+        self.statistics_lock = asyncio.Lock()
+        self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.automatic_bans: set[tuple[int, int]] = set()
 
     def claim_interaction(self, interaction_id: int) -> bool:
@@ -518,6 +524,8 @@ class Bot(commands.Bot):
         await self.tree.sync()
         if not punishment_expiry_loop.is_running():
             punishment_expiry_loop.start()
+        if not statistics_refresh_loop.is_running():
+            statistics_refresh_loop.start()
 
     async def on_ready(self) -> None:
         if self.started:
@@ -2419,6 +2427,124 @@ async def remove_voice(channel: discord.VoiceChannel) -> None:
 
 
 # ============================================================
+# КАНАЛЫ СТАТИСТИКИ
+# ============================================================
+
+
+def statistics_setting_key(guild_id: int, statistic: str) -> str:
+    return f"statistics_channel:{guild_id}:{statistic}"
+
+
+def find_statistics_channel(
+    guild: discord.Guild,
+    statistic: str,
+    prefixes: tuple[str, ...],
+) -> discord.VoiceChannel | None:
+    stored_id = bot.store.get(statistics_setting_key(guild.id, statistic))
+    stored_channel = guild.get_channel(stored_id) if stored_id else None
+    if isinstance(stored_channel, discord.VoiceChannel):
+        return stored_channel
+    return next(
+        (
+            channel
+            for channel in guild.voice_channels
+            if any(channel.name.startswith(prefix) for prefix in prefixes)
+        ),
+        None,
+    )
+
+
+async def ensure_statistics_channel(
+    guild: discord.Guild,
+    statistic: str,
+    name: str,
+    prefixes: tuple[str, ...],
+) -> discord.VoiceChannel:
+    channel = find_statistics_channel(guild, statistic, prefixes)
+    if channel is None:
+        channel = await guild.create_voice_channel(
+            name,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=False,
+                ),
+            },
+            reason="Создание канала статистики",
+        )
+    bot.store.set(statistics_setting_key(guild.id, statistic), channel.id)
+
+    everyone_overwrite = channel.overwrites_for(guild.default_role)
+    if everyone_overwrite.view_channel is not True or everyone_overwrite.connect is not False:
+        everyone_overwrite.view_channel = True
+        everyone_overwrite.connect = False
+        await channel.set_permissions(
+            guild.default_role,
+            overwrite=everyone_overwrite,
+            reason="Настройка доступа к каналу статистики",
+        )
+    if channel.name != name:
+        await channel.edit(name=name, reason="Обновление статистики сервера")
+    return channel
+
+
+async def update_statistics_channels(guild: discord.Guild) -> None:
+    if guild.id != GUILD_ID:
+        return
+    async with bot.statistics_lock:
+        if not guild.chunked:
+            try:
+                await guild.chunk(cache=True)
+            except (discord.HTTPException, discord.ClientException):
+                logging.exception("Не удалось загрузить список участников для статистики сервера %s", guild.id)
+
+        player_role = guild.get_role(PLAYER_ROLE_ID)
+        member_count = sum(not member.bot for member in guild.members)
+        player_count = sum(not member.bot for member in player_role.members) if player_role else 0
+        specifications = (
+            ("ip", STATISTICS_IP_NAME, ("IP:",)),
+            ("members", f"{STATISTICS_MEMBERS_PREFIX} {member_count}", (STATISTICS_MEMBERS_PREFIX, "Участники:")),
+            ("players", f"{STATISTICS_PLAYERS_PREFIX} {player_count}", (STATISTICS_PLAYERS_PREFIX,)),
+        )
+        for statistic, name, prefixes in specifications:
+            await ensure_statistics_channel(guild, statistic, name, prefixes)
+
+
+async def delayed_statistics_update(guild: discord.Guild) -> None:
+    try:
+        await asyncio.sleep(STATISTICS_UPDATE_DELAY_SECONDS)
+        await update_statistics_channels(guild)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Не удалось обновить каналы статистики сервера %s", guild.id)
+    finally:
+        current_task = asyncio.current_task()
+        if bot.statistics_update_tasks.get(guild.id) is current_task:
+            bot.statistics_update_tasks.pop(guild.id, None)
+
+
+def schedule_statistics_update(guild: discord.Guild) -> None:
+    current_task = bot.statistics_update_tasks.get(guild.id)
+    if current_task is None or current_task.done():
+        bot.statistics_update_tasks[guild.id] = asyncio.create_task(delayed_statistics_update(guild))
+
+
+@tasks.loop(minutes=10)
+async def statistics_refresh_loop() -> None:
+    for guild in bot.guilds:
+        try:
+            await update_statistics_channels(guild)
+        except Exception:
+            logging.exception("Не удалось проверить каналы статистики сервера %s", guild.id)
+
+
+@statistics_refresh_loop.before_loop
+async def before_statistics_refresh_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# ============================================================
 # СОБЫТИЯ
 # ============================================================
 
@@ -2433,6 +2559,20 @@ async def on_member_join(member: discord.Member) -> None:
         await restore_member_punishments(member, roles)
     except discord.HTTPException:
         logging.exception("Не удалось восстановить наказания пользователя %s после входа", member.id)
+    schedule_statistics_update(member.guild)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    schedule_statistics_update(member.guild)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    had_player_role = before.get_role(PLAYER_ROLE_ID) is not None
+    has_player_role = after.get_role(PLAYER_ROLE_ID) is not None
+    if had_player_role != has_player_role:
+        schedule_statistics_update(after.guild)
 
 
 @bot.event
@@ -2486,6 +2626,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
     if isinstance(channel, discord.VoiceChannel):
         bot.store.remove_voice(channel.id)
+        schedule_statistics_update(channel.guild)
 
 
 @bot.tree.command(name="установка", description="Проверить панели бота")
