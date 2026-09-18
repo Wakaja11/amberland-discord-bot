@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 import struct
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -807,6 +807,11 @@ async def require_player_nickname(interaction: discord.Interaction, member: disc
     return nickname
 
 
+def capitalized_field_value(value: str) -> str:
+    cleaned = value.strip()
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else "Не указано"
+
+
 def punishment_embed(
     title: str,
     moderator: discord.Member | None,
@@ -816,9 +821,12 @@ def punishment_embed(
     extra: str | None = None,
     appeal: bool = False,
 ) -> discord.Embed:
-    lines = [f"**Причина:** {reason}", f"**Модератор:** {moderator.mention if moderator else 'Система'}"]
+    lines = [
+        f"**Причина:** {capitalized_field_value(reason)}",
+        f"**Модератор:** {moderator.mention if moderator else 'Система'}",
+    ]
     if duration:
-        lines.insert(0, f"**Срок:** {duration}")
+        lines.insert(0, f"**Срок:** {capitalized_field_value(duration)}")
     if extra:
         lines.append(extra)
     if appeal:
@@ -839,10 +847,10 @@ async def log_punishment(
     fields: dict[str, object] = {
         "Пользователь": f"{user.mention} ({user})",
         "Модератор": moderator.mention if moderator else "Система",
-        "Причина": reason,
+        "Причина": capitalized_field_value(reason),
     }
     if duration:
-        fields["Срок"] = duration
+        fields["Срок"] = capitalized_field_value(duration)
     await bot.log(
         guild,
         action,
@@ -1668,7 +1676,7 @@ def history_line(row: sqlite3.Row) -> str:
         "unwarn": "Снятие предупреждения",
     }
     moderator = f"<@{row['moderator_id']}>" if row["moderator_id"] else "Система"
-    reason = discord.utils.escape_markdown(str(row["reason"]))[:500]
+    reason = discord.utils.escape_markdown(capitalized_field_value(str(row["reason"])))[:500]
     expiry = f"; до <t:{row['expires_at']}:f>" if row["expires_at"] else ""
     status = "; активно" if row["active"] else ""
     return f"<t:{row['created_at']}:f> — **{labels.get(row['kind'], row['kind'])}**{expiry}{status}\n{reason} · {moderator}"
@@ -1775,6 +1783,9 @@ async def mute_member(
     seconds, duration_label, rcon_duration = parsed
     await interaction.response.defer(ephemeral=True)
     roles = await moderation_roles(interaction.guild)
+    started_at = int(datetime.now(timezone.utc).timestamp())
+    expires_at = started_at + seconds
+    duration_period = f"С <t:{started_at}:f> по <t:{expires_at}:f>"
     async with bot.moderation_lock:
         if roles["mute"] in member.roles or bot.store.active_count(interaction.guild.id, member.id, "mute"):
             await interaction.followup.send("У пользователя уже есть активный мут", ephemeral=True)
@@ -1788,7 +1799,6 @@ async def mute_member(
             logging.exception("Не удалось выдать роль мута пользователю %s", member.id)
             await interaction.followup.send("Discord не принял выдачу роли мута. Попробуйте ещё раз", ephemeral=True)
             return
-        expires_at = int((datetime.now(timezone.utc) + timedelta(seconds=seconds)).timestamp())
         permission_failures = await apply_member_mute_overwrites(member)
         try:
             await rcon_command(TEMPMUTE_COMMAND.format(
@@ -1804,9 +1814,21 @@ async def mute_member(
                 logging.exception("Не удалось откатить роль мута пользователя %s", member.id)
             await interaction.followup.send(f"Не удалось выдать мут в Minecraft: {error}", ephemeral=True)
             return
-        bot.store.add_punishment(interaction.guild.id, member.id, "mute", interaction.user.id, reason, expires_at=expires_at, active=True)
-    notice_sent = await dm(member, punishment_embed("Вам выдан мут", interaction.user, reason, duration=f"{duration_label} (до <t:{expires_at}:f>)"))
-    await log_punishment(interaction.guild, "Пользователю выдан мут", member, interaction.user, reason, duration=f"до <t:{expires_at}:f>")
+        bot.store.add_punishment(
+            interaction.guild.id,
+            member.id,
+            "mute",
+            interaction.user.id,
+            reason,
+            expires_at=expires_at,
+            active=True,
+            created_at=started_at,
+        )
+    notice_sent = await dm(
+        member,
+        punishment_embed("Вам выдан мут", interaction.user, reason, duration=f"{duration_period} ({duration_label})"),
+    )
+    await log_punishment(interaction.guild, "Пользователю выдан мут", member, interaction.user, reason, duration=duration_period)
     suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
     if permission_failures:
         suffix += f". Не удалось обновить права в каналах: {permission_failures}"
@@ -1880,6 +1902,7 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     roles = await moderation_roles(interaction.guild)
     now = int(datetime.now(timezone.utc).timestamp())
     expires_at = now + WARNING_LIFETIME_SECONDS
+    warning_period = f"С <t:{now}:f> по <t:{expires_at}:f>"
     automatic_ban_key = (interaction.guild.id, member.id)
     async with bot.moderation_lock:
         if automatic_ban_key in bot.automatic_bans:
@@ -1927,7 +1950,7 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
             "Вам выдано предупреждение",
             interaction.user,
             reason,
-            duration=f"до <t:{expires_at}:f>",
+            duration=warning_period,
             extra=f"**Активных предупреждений:** {warning_count}/3",
         ),
     )
@@ -1937,7 +1960,7 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
         member,
         interaction.user,
         reason,
-        duration=f"до <t:{expires_at}:f> · {warning_count}/3",
+        duration=f"{warning_period} · {warning_count}/3",
         colour_html=GOLD_EMBED_COLOR_HTML,
     )
     if warning_count < 3:
