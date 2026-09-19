@@ -576,8 +576,9 @@ class Bot(commands.Bot):
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=GUILD_ID)
-        await self.tree.sync(guild=guild)
-        await self.tree.sync()
+        self.tree.copy_global_to(guild=guild)
+        synced_commands = await self.tree.sync(guild=guild)
+        logging.info("Slash-команды синхронизированы: %s", len(synced_commands))
         if not punishment_expiry_loop.is_running():
             punishment_expiry_loop.start()
         if not statistics_refresh_loop.is_running():
@@ -1941,7 +1942,6 @@ async def restore_shared_ticket_permissions(channel: discord.TextChannel) -> Non
 
 
 @bot.tree.command(name="добавить", description="Добавить пользователя в текущее обращение")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(user="Пользователь, которому нужно открыть доступ")
 async def add_to_ticket(interaction: discord.Interaction, user: discord.Member) -> None:
     roles = await staff(interaction)
@@ -2102,7 +2102,6 @@ class BanConfirmation(discord.ui.View):
 
 
 @bot.tree.command(name="бан", description="Навсегда заблокировать игрока на Minecraft-сервере")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", reason="причина")
 @app_commands.describe(member="Пользователь", reason="Причина блокировки")
 async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
@@ -2132,7 +2131,6 @@ async def ban_member(interaction: discord.Interaction, member: discord.Member, r
 
 
 @bot.tree.command(name="разбан", description="Снять блокировку с пользователя")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", reason="причина")
 @app_commands.describe(member="Пользователь", reason="Причина снятия блокировки")
 async def unban_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
@@ -2171,7 +2169,6 @@ async def unban_member(interaction: discord.Interaction, member: discord.Member,
 
 
 @bot.tree.command(name="мут", description="Запретить пользователю писать и говорить")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", duration="время", reason="причина")
 @app_commands.describe(member="Пользователь", duration="Например: 30м, 12ч или 3д", reason="Причина мута")
 async def mute_member(
@@ -2245,7 +2242,6 @@ async def mute_member(
 
 
 @bot.tree.command(name="размут", description="Снять мут с пользователя")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", reason="причина")
 @app_commands.describe(member="Пользователь", reason="Причина снятия мута")
 async def unmute_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
@@ -2453,7 +2449,6 @@ class ThirdWarningConfirmation(discord.ui.View):
 
 
 @bot.tree.command(name="пред", description="Выдать пользователю предупреждение")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", reason="причина")
 @app_commands.describe(member="Пользователь", reason="Причина предупреждения")
 async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
@@ -2484,7 +2479,6 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
 
 
 @bot.tree.command(name="разпред", description="Снять последнее активное предупреждение")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(member="ник", reason="причина")
 @app_commands.describe(member="Пользователь", reason="Причина снятия предупреждения")
 async def unwarn_member(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 1000]) -> None:
@@ -2519,7 +2513,6 @@ async def unwarn_member(interaction: discord.Interaction, member: discord.Member
 
 
 @bot.tree.command(name="наказания", description="Показать историю наказаний пользователя за последний месяц")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.rename(user="ник")
 @app_commands.describe(user="Пользователь")
 async def punishment_history(interaction: discord.Interaction, user: discord.User) -> None:
@@ -3113,7 +3106,6 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
 
 
 @bot.tree.command(name="установка", description="Проверить панели бота")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(administrator=True)
 async def setup(interaction: discord.Interaction) -> None:
     if not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
