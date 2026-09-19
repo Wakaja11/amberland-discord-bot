@@ -1003,17 +1003,42 @@ async def update_moderator_documentation(guild: discord.Guild) -> None:
     if not isinstance(channel, discord.TextChannel):
         logging.warning("Канал документации %s не найден", DOCUMENTATION_CHANNEL_ID)
         return
+    desired_embeds = moderator_documentation_embeds()
     previous_id = bot.store.get(f"documentation:{guild.id}") or DOCUMENTATION_MESSAGE_ID
+    previous_message: discord.Message | None = None
+    if previous_id:
+        try:
+            previous_message = await channel.fetch_message(previous_id)
+        except discord.HTTPException:
+            previous_message = None
+    if previous_message is None:
+        async for candidate in channel.history(limit=100):
+            if candidate.author.id != bot.user.id or not candidate.embeds:
+                continue
+            if candidate.embeds[0].title == desired_embeds[0].title:
+                previous_message = candidate
+                break
+
+    if previous_message is not None and len(previous_message.embeds) == len(desired_embeds):
+        matches = all(
+            actual.title == desired.title
+            and actual.description == desired.description
+            and actual.colour == desired.colour
+            for actual, desired in zip(previous_message.embeds, desired_embeds)
+        )
+        if matches:
+            bot.store.set(f"documentation:{guild.id}", previous_message.id)
+            return
     try:
-        message = await channel.send(embeds=moderator_documentation_embeds())
-    except discord.Forbidden:
-        logging.exception("Боту не хватает прав для публикации документации")
+        message = await channel.send(embeds=desired_embeds)
+    except discord.HTTPException:
+        logging.exception("Не удалось опубликовать документацию")
         return
     bot.store.set(f"documentation:{guild.id}", message.id)
-    if previous_id and previous_id != message.id:
+    if previous_message is not None and previous_message.id != message.id:
         try:
-            await (await channel.fetch_message(previous_id)).delete()
-        except (discord.NotFound, discord.Forbidden):
+            await previous_message.delete()
+        except discord.HTTPException:
             pass
 
 
