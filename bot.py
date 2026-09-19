@@ -43,6 +43,7 @@ SPAM_PROTECTION_CHANNEL_ID = 1485655876193882363
 LOG_CHANNEL_ID = 1486338493029548094
 DOCUMENTATION_CHANNEL_ID = 1550499602040487996
 DOCUMENTATION_MESSAGE_ID = 1550502972847558701
+DAILY_SUMMARY_THREAD_NAME = "Ежедневные сводки"
 VOICE_CREATOR_CHANNEL_ID = 1498318412080746556
 VOICE_CATEGORY_ID = 1485288483881746623
 GUEST_ROLE_ID = 1485642937860620518
@@ -591,6 +592,7 @@ class Bot(commands.Bot):
         for guild in self.guilds:
             try:
                 await update_moderator_documentation(guild)
+                await ensure_daily_summary_thread(guild)
                 await self.roles(guild)
                 await setup_moderation(guild)
                 await panels(guild)
@@ -987,7 +989,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Ежедневная сводка",
-            "Каждый день в 00:00 по московскому времени в этом канале публикуется сводка за прошедший день.",
+            "Каждый день в 00:00 по московскому времени в ветке **Ежедневные сводки** публикуется сводка за прошедший день. Ранее опубликованные сводки сохраняются.",
         ),
     )
     return [
@@ -1029,10 +1031,72 @@ async def daily_log_actions(guild: discord.Guild, summary_day: date) -> Counter[
     return actions
 
 
-async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None:
+async def ensure_daily_summary_thread(guild: discord.Guild) -> discord.Thread | None:
     channel = guild.get_channel(DOCUMENTATION_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         logging.warning("Канал документации для ежедневной сводки не найден")
+        return None
+
+    header_id = bot.store.get(f"daily_summary_header:{guild.id}")
+    header: discord.Message | None = None
+    if header_id:
+        try:
+            header = await channel.fetch_message(header_id)
+        except discord.HTTPException:
+            header = None
+    if header is None:
+        async for message in channel.history(limit=100):
+            if message.author.id != bot.user.id or not message.embeds:
+                continue
+            if message.embeds[0].title == DAILY_SUMMARY_THREAD_NAME:
+                header = message
+                break
+    if header is None:
+        header_embed = discord.Embed(
+            title=DAILY_SUMMARY_THREAD_NAME,
+            description="Сводки за прошедшие дни публикуются в ветке этого сообщения.",
+            colour=colour(GOLD_EMBED_COLOR_HTML),
+        )
+        try:
+            header = await channel.send(embed=header_embed)
+        except discord.HTTPException:
+            logging.exception("Не удалось опубликовать заголовок ежедневных сводок")
+            return None
+    bot.store.set(f"daily_summary_header:{guild.id}", header.id)
+
+    thread_id = bot.store.get(f"daily_summary_thread:{guild.id}") or header.id
+    thread = guild.get_thread(thread_id)
+    if thread is None:
+        try:
+            fetched_channel = await bot.fetch_channel(thread_id)
+            if isinstance(fetched_channel, discord.Thread):
+                thread = fetched_channel
+        except discord.HTTPException:
+            thread = None
+    if thread is None:
+        try:
+            thread = await channel.create_thread(
+                name=DAILY_SUMMARY_THREAD_NAME,
+                message=header,
+                auto_archive_duration=1440,
+                reason="Создание ветки ежедневных сводок",
+            )
+        except discord.HTTPException:
+            logging.exception("Не удалось создать ветку ежедневных сводок")
+            return None
+    if thread.archived:
+        try:
+            await thread.edit(archived=False, reason="Публикация ежедневной сводки")
+        except discord.HTTPException:
+            logging.exception("Не удалось открыть ветку ежедневных сводок")
+            return None
+    bot.store.set(f"daily_summary_thread:{guild.id}", thread.id)
+    return thread
+
+
+async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None:
+    thread = await ensure_daily_summary_thread(guild)
+    if thread is None:
         return
     actions = await daily_log_actions(guild, summary_day)
     metrics = bot.store.daily_metrics(summary_day)
@@ -1053,19 +1117,7 @@ async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None
     embed.add_field(name="Заявки", value=f"Принято: **{accepted}** · отклонено: **{rejected}**", inline=False)
     embed.add_field(name="Тикеты", value=f"Закрыто: **{tickets_closed}**", inline=False)
     embed.add_field(name="Наказания", value=punishment_lines, inline=False)
-    new_message = await channel.send(embed=embed)
-
-    previous_id = bot.store.get(f"daily_summary_message:{guild.id}")
-    if previous_id and previous_id != new_message.id:
-        previous_channel_id = bot.store.get(f"daily_summary_channel:{guild.id}") or LOG_CHANNEL_ID
-        previous_channel = guild.get_channel(previous_channel_id)
-        try:
-            if isinstance(previous_channel, discord.TextChannel):
-                await (await previous_channel.fetch_message(previous_id)).delete()
-        except (discord.NotFound, discord.Forbidden):
-            pass
-    bot.store.set(f"daily_summary_message:{guild.id}", new_message.id)
-    bot.store.set(f"daily_summary_channel:{guild.id}", channel.id)
+    await thread.send(embed=embed)
     bot.store.set(f"daily_summary_date:{guild.id}", int(summary_day.strftime("%Y%m%d")))
 
 
@@ -1073,10 +1125,7 @@ async def ensure_daily_summary(guild: discord.Guild) -> None:
     async with bot.daily_summary_lock:
         summary_day = datetime.now(MOSCOW_TIMEZONE).date() - timedelta(days=1)
         summary_key = int(summary_day.strftime("%Y%m%d"))
-        if (
-            bot.store.get(f"daily_summary_date:{guild.id}") == summary_key
-            and bot.store.get(f"daily_summary_channel:{guild.id}") == DOCUMENTATION_CHANNEL_ID
-        ):
+        if bot.store.get(f"daily_summary_date:{guild.id}") == summary_key:
             return
         await publish_daily_summary(guild, summary_day)
 
@@ -3047,6 +3096,7 @@ async def setup(interaction: discord.Interaction) -> None:
     await restore(interaction.guild)
     await update_statistics_channels(interaction.guild)
     await update_moderator_documentation(interaction.guild)
+    await ensure_daily_summary_thread(interaction.guild)
     await interaction.followup.send("Панели, каналы статистики, документация и активные кнопки проверены", ephemeral=True)
 
 
