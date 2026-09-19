@@ -1038,8 +1038,6 @@ async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None
     metrics = bot.store.daily_metrics(summary_day)
     accepted = actions["Заявка принята"]
     rejected = actions["Заявка отклонена"]
-    event_accepted = actions["Ивент одобрен"]
-    event_rejected = actions["Заявка на ивент отклонена"]
     tickets_closed = actions["Обращение закрыто модератором"] + actions["Проблема решена игроком"]
     punishment_lines = (
         f"Баны: **{actions['Пользователь заблокирован'] + actions['Пользователь автоматически заблокирован']}** · снято: **{actions['Пользователь разблокирован']}**\n"
@@ -1052,10 +1050,9 @@ async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Участники", value=f"Новых: **{metrics.get('new_members', 0)}**\nПиковый онлайн Minecraft: **{metrics.get('peak_online', 0)}**", inline=False)
-    embed.add_field(name="Заявки", value=f"Принято: **{accepted}** · отклонено: **{rejected}**\nИвенты: **{event_accepted}** одобрено · **{event_rejected}** отклонено", inline=False)
+    embed.add_field(name="Заявки", value=f"Принято: **{accepted}** · отклонено: **{rejected}**", inline=False)
     embed.add_field(name="Тикеты", value=f"Закрыто: **{tickets_closed}**", inline=False)
     embed.add_field(name="Наказания", value=punishment_lines, inline=False)
-    embed.add_field(name="Ошибки связи с Minecraft", value=f"**{metrics.get('rcon_errors', 0)}**", inline=False)
     new_message = await channel.send(embed=embed)
 
     previous_id = bot.store.get(f"daily_summary_message:{guild.id}")
