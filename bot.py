@@ -29,6 +29,7 @@ RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 RCON_TIMEOUT_SECONDS = 10
 WHITELIST_COMMAND = "whitelist add {nickname}"
 BAN_COMMAND = "ban {nickname} {reason}"
+TEMPBAN_COMMAND = "tempban {nickname} {duration} {reason}"
 UNBAN_COMMAND = "unban {nickname}"
 TEMPMUTE_COMMAND = "tempmute {nickname} {duration} {reason}"
 UNMUTE_COMMAND = "unmute {nickname}"
@@ -974,7 +975,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Наказания",
-            "`/бан ник причина` — бессрочный бан на Minecraft-сервере; перед выполнением требуется подтверждение.\n`/разбан ник причина` — снять бан.\n`/мут ник время причина` — выдать мут.\n`/размут ник причина` — снять мут.\n`/наказания ник` — показать действия за последний месяц и актуальные наказания.",
+            "`/бан ник причина` — бессрочный бан на Minecraft-сервере.\n`/врембан ник время причина` — временный бан на Minecraft-сервере.\n`/разбан ник причина` — снять бан.\n`/мут ник время причина` — выдать мут.\n`/размут ник причина` — снять мут.\n`/наказания ник` — показать действия за последний месяц и актуальные наказания.\n\nПеред бессрочным и временным баном требуется подтверждение.",
         ),
         (
             "Предупреждения",
@@ -2080,6 +2081,83 @@ async def perform_ban(interaction: discord.Interaction, member: discord.Member, 
     await interaction.followup.send(f"{member.mention} заблокирован на Minecraft-сервере навсегда{suffix}", ephemeral=True)
 
 
+async def perform_temporary_ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+    seconds: int,
+    rcon_duration: str,
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("Команда доступна только на сервере", ephemeral=True)
+        return
+    nickname = await require_player_nickname(interaction, member)
+    if nickname is None:
+        return
+    roles = await moderation_roles(interaction.guild)
+    if bot.store.active_count(interaction.guild.id, member.id, "ban") or roles["ban"] in member.roles:
+        await interaction.followup.send("У пользователя уже есть активный бан", ephemeral=True)
+        return
+    started_at = int(datetime.now(timezone.utc).timestamp())
+    expires_at = started_at + seconds
+    duration_period = punishment_period(started_at, expires_at)
+    try:
+        await member.add_roles(roles["ban"], reason=audit_reason("Временный бан", interaction.user, reason))
+    except discord.Forbidden:
+        await interaction.followup.send("Боту не хватает прав, чтобы выдать роль бана", ephemeral=True)
+        return
+    except discord.HTTPException:
+        logging.exception("Не удалось выдать роль временного бана пользователю %s", member.id)
+        await interaction.followup.send("Discord не принял роль бана. Попробуйте ещё раз", ephemeral=True)
+        return
+    try:
+        await rcon_command(TEMPBAN_COMMAND.format(
+            nickname=nickname,
+            duration=rcon_duration,
+            reason=safe_rcon_reason(reason),
+        ))
+    except RconError as error:
+        try:
+            await member.remove_roles(roles["ban"], reason="Откат: временный Minecraft-бан не выполнен")
+        except discord.HTTPException:
+            logging.exception("Не удалось откатить роль временного бана пользователя %s", member.id)
+        await interaction.followup.send(f"Не удалось временно заблокировать игрока в Minecraft: {error}", ephemeral=True)
+        return
+    bot.store.add_punishment(
+        interaction.guild.id,
+        member.id,
+        "ban",
+        interaction.user.id,
+        reason,
+        expires_at=expires_at,
+        active=True,
+        created_at=started_at,
+    )
+    notice_sent = await dm(
+        member,
+        punishment_embed(
+            "Вы временно заблокированы на Minecraft-сервере",
+            interaction.user,
+            reason,
+            duration=duration_period,
+            appeal=True,
+        ),
+    )
+    await log_punishment(
+        interaction.guild,
+        "Пользователь заблокирован",
+        member,
+        interaction.user,
+        reason,
+        duration=duration_period,
+    )
+    suffix = "" if notice_sent else ". Личное сообщение доставить не удалось"
+    await interaction.followup.send(
+        f"{member.mention} заблокирован на Minecraft-сервере до <t:{expires_at}:f>{suffix}",
+        ephemeral=True,
+    )
+
+
 class BanConfirmation(discord.ui.View):
     def __init__(self, moderator_id: int, member: discord.Member, reason: str) -> None:
         super().__init__(timeout=60)
@@ -2103,6 +2181,46 @@ class BanConfirmation(discord.ui.View):
             await interaction.response.send_message("Отменить действие может только вызвавший команду модератор", ephemeral=True)
             return
         await interaction.response.edit_message(content="Блокировка отменена", embed=None, view=None)
+
+
+class TemporaryBanConfirmation(discord.ui.View):
+    def __init__(
+        self,
+        moderator_id: int,
+        member: discord.Member,
+        reason: str,
+        seconds: int,
+        rcon_duration: str,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.moderator_id = moderator_id
+        self.member = member
+        self.reason = reason
+        self.seconds = seconds
+        self.rcon_duration = rcon_duration
+
+    @discord.ui.button(label="Подтвердить временный бан", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Подтвердить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        if not await moderation_target(interaction, self.member):
+            return
+        await interaction.response.edit_message(content="Временная блокировка выполняется…", embed=None, view=None)
+        await perform_temporary_ban(
+            interaction,
+            self.member,
+            self.reason,
+            self.seconds,
+            self.rcon_duration,
+        )
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("Отменить действие может только вызвавший команду модератор", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Временная блокировка отменена", embed=None, view=None)
 
 
 @bot.tree.command(name="бан", description="Навсегда заблокировать игрока на Minecraft-сервере")
@@ -2130,6 +2248,51 @@ async def ban_member(interaction: discord.Interaction, member: discord.Member, r
     await interaction.response.send_message(
         embed=embed,
         view=BanConfirmation(interaction.user.id, member, reason),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="врембан", description="Временно заблокировать игрока на Minecraft-сервере")
+@app_commands.rename(member="ник", duration="время", reason="причина")
+@app_commands.describe(member="Пользователь", duration="Например: 30м, 12ч или 3д", reason="Причина блокировки")
+async def temporary_ban_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: app_commands.Range[str, 2, 16],
+    reason: app_commands.Range[str, 1, 1000],
+) -> None:
+    if not await moderation_target(interaction, member) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    nickname = await require_player_nickname(interaction, member)
+    if nickname is None:
+        return
+    parsed = parse_duration(duration)
+    if parsed is None:
+        await interaction.response.send_message("Укажите время в формате `30м`, `12ч` или `3д` (не более 10 лет)", ephemeral=True)
+        return
+    seconds, readable_duration, rcon_duration = parsed
+    roles = await moderation_roles(interaction.guild)
+    if bot.store.active_count(interaction.guild.id, member.id, "ban") or roles["ban"] in member.roles:
+        await interaction.response.send_message("У пользователя уже есть активный бан", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="Подтверждение временной блокировки",
+        description=(
+            f"**Пользователь:** {member.mention} (`{nickname}`)\n"
+            f"**Срок:** {capitalized_field_value(readable_duration)}\n"
+            f"**Причина:** {capitalized_field_value(reason)}"
+        ),
+        colour=colour(APPLICATION_REJECTED_COLOR_HTML),
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=TemporaryBanConfirmation(
+            interaction.user.id,
+            member,
+            reason,
+            seconds,
+            rcon_duration,
+        ),
         ephemeral=True,
     )
 
