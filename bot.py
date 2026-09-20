@@ -1094,15 +1094,19 @@ async def ensure_daily_summary_thread(guild: discord.Guild) -> discord.Thread | 
             return None
     bot.store.set(f"daily_summary_header:{guild.id}", header.id)
 
-    thread_id = bot.store.get(f"daily_summary_thread:{guild.id}") or header.id
-    thread = guild.get_thread(thread_id)
-    if thread is None:
+    stored_thread_id = bot.store.get(f"daily_summary_thread:{guild.id}")
+    thread: discord.Thread | None = None
+    for thread_id in dict.fromkeys(filter(None, (stored_thread_id, header.id))):
+        thread = guild.get_thread(thread_id)
+        if thread is not None:
+            break
         try:
             fetched_channel = await bot.fetch_channel(thread_id)
             if isinstance(fetched_channel, discord.Thread):
                 thread = fetched_channel
+                break
         except discord.HTTPException:
-            thread = None
+            continue
     if thread is None:
         try:
             thread = await channel.create_thread(
