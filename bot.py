@@ -363,6 +363,12 @@ def embed_details(message: discord.Message, title: str) -> dict[str, str]:
     return {}
 
 
+def embed_without_field(embed: discord.Embed, field_name: str) -> discord.Embed:
+    data = embed.to_dict()
+    data["fields"] = [field for field in data.get("fields", []) if field.get("name") != field_name]
+    return discord.Embed.from_dict(data)
+
+
 async def application_nickname(channel: discord.TextChannel) -> str | None:
     nickname = bot.store.application_nickname(channel.id)
     if nickname:
@@ -1311,15 +1317,24 @@ async def restore(guild: discord.Guild) -> None:
                                 for row in message.components
                                 for component in row.children
                             )
-                            if has_removed_buttons:
+                            has_author_field = any(
+                                field.name == "Автор"
+                                for embed in message.embeds
+                                for field in embed.fields
+                            )
+                            if has_removed_buttons or has_author_field:
                                 replacement = await channel.send(
                                     content=message.content or None,
-                                    embeds=message.embeds,
+                                    embeds=[embed_without_field(embed, "Автор") for embed in message.embeds],
                                     view=TicketControls(user_id),
                                     allowed_mentions=discord.AllowedMentions.none(),
                                 )
                                 await message.delete()
-                                logging.info("Панель тикета %s перепубликована сообщением %s", channel.id, replacement.id)
+                                logging.info(
+                                    "Панель тикета %s перепубликована сообщением %s без устаревших элементов",
+                                    channel.id,
+                                    replacement.id,
+                                )
                             break
                 except discord.HTTPException:
                     logging.exception("Не удалось убрать старые кнопки управления тикетом %s", channel.id)
@@ -1926,7 +1941,6 @@ class HelpForm(discord.ui.Modal):
         )
         title, fields = FORMS[self.kind]
         embed = discord.Embed(title=title, colour=colour(TICKET_EMBED_COLOR_HTML), timestamp=datetime.now(timezone.utc))
-        embed.add_field(name="Автор", value=interaction.user.mention, inline=False)
         for (label, _), item in zip(fields, self.inputs):
             value = item.value or "Не указано"
             embed.add_field(name=label, value=value, inline=False)
