@@ -38,6 +38,9 @@ UNWARN_COMMAND = "unwarn {nickname}"
 
 APPLICATION_PANEL_CHANNEL_ID = 1486337529954304080
 HELP_PANEL_CHANNEL_ID = 1495766775734865930
+HELP_PANEL_IMAGE_URL = "https://discord-webhook.com/uploads/5660c51658d833fda1221705ceb87001.jpg"
+HELP_PANEL_EMOJI_NAME = "_totem_al"
+HELP_PANEL_UPDATED_AT = 1789938000
 APPLICATION_CATEGORY_ID = 1500023409952686190
 TICKET_CATEGORY_ID = 1485653736335605841
 SPAM_PROTECTION_CHANNEL_ID = 1485655876193882363
@@ -949,7 +952,6 @@ async def log_punishment(
 async def panels(guild: discord.Guild) -> None:
     items = [
         ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком? Нажмите кнопку ниже и заполните короткую заявку", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
-        ("help", HELP_PANEL_CHANNEL_ID, discord.Embed(description="Нужна помощь? Нажмите кнопку, выберите тему обращения и опишите ситуацию", colour=colour(HELP_PANEL_COLOR_HTML)), HelpPanel()),
     ]
     for key, channel_id, embed, view in items:
         channel = guild.get_channel(channel_id)
@@ -963,10 +965,33 @@ async def panels(guild: discord.Guild) -> None:
                 await (await channel.fetch_message(message_id)).delete()
             except (discord.NotFound, discord.Forbidden):
                 pass
+    await publish_help_panel(guild)
     await publish_spam_protection_panel(guild)
     spam = guild.get_channel(SPAM_PROTECTION_CHANNEL_ID)
     if isinstance(spam, discord.TextChannel):
         await spam.set_permissions(guild.default_role, view_channel=True, send_messages=True, reason="Настройка антиспама")
+
+
+async def publish_help_panel(guild: discord.Guild) -> None:
+    channel = guild.get_channel(HELP_PANEL_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logging.warning("Канал помощи %s не найден", HELP_PANEL_CHANNEL_ID)
+        return
+    previous_id = bot.store.get(f"help:{guild.id}")
+    try:
+        message = await channel.send(
+            view=HelpPanel(guild),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logging.exception("Не удалось опубликовать панель помощи")
+        return
+    bot.store.set(f"help:{guild.id}", message.id)
+    if previous_id and previous_id != message.id:
+        try:
+            await (await channel.fetch_message(previous_id)).delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
 
 
 def spam_protection_view(guild: discord.Guild) -> discord.ui.LayoutView:
@@ -1318,7 +1343,7 @@ async def before_daily_summary_loop() -> None:
 
 
 async def restore(guild: discord.Guild) -> None:
-    for key, view in (("application", ApplicationPanel()), ("help", HelpPanel())):
+    for key, view in (("application", ApplicationPanel()), ("help", HelpPanel(guild))):
         message_id = bot.store.get(f"{key}:{guild.id}")
         if message_id:
             bot.add_view(view, message_id=message_id)
@@ -2023,12 +2048,34 @@ class HelpMenu(discord.ui.View):
         self.add_item(HelpSelect())
 
 
-class HelpPanel(discord.ui.View):
-    def __init__(self) -> None:
+class HelpPanel(discord.ui.LayoutView):
+    def __init__(self, guild: discord.Guild | None = None) -> None:
         super().__init__(timeout=None)
+        emoji = discord.utils.get(guild.emojis, name=HELP_PANEL_EMOJI_NAME) if guild is not None else None
+        emoji_text = str(emoji) if emoji is not None else f":{HELP_PANEL_EMOJI_NAME}:"
+        button = discord.ui.Button(
+            label="Обратиться за помощью",
+            style=discord.ButtonStyle.primary,
+            custom_id="help:open",
+        )
+        button.callback = self.open
+        self.add_item(discord.ui.Container(
+            discord.ui.MediaGallery(discord.MediaGalleryItem(HELP_PANEL_IMAGE_URL)),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay(
+                f"# {emoji_text} Поддержка администрации\n"
+                "Нажмите кнопку ниже, чтобы создать обращение по интересующему вопросу.\n"
+                "- График работы администрации: с 10:00 до 22:00 по московскому времени (МСК).\n"
+                "- Обращения, в которых отсутствует активность со стороны пользователя в течение трех дней, "
+                "закрываются администрацией.\n"
+                "- За оффтоп, злоупотребление нецензурной лексикой и оскорбления в обращении предусмотрены штрафы."
+            ),
+            discord.ui.ActionRow(button),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay(f"-# Последнее обновление - <t:{HELP_PANEL_UPDATED_AT}:D>"),
+        ))
 
-    @discord.ui.button(label="Обратиться за помощью", style=discord.ButtonStyle.primary, custom_id="help:open")
-    async def open(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    async def open(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Выберите тему обращения:", view=HelpMenu(), ephemeral=True)
 
 
