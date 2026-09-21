@@ -1034,6 +1034,7 @@ async def update_moderator_documentation(guild: discord.Guild) -> None:
         )
         if matches:
             bot.store.set(f"documentation:{guild.id}", previous_message.id)
+            await ensure_daily_summary_after_documentation(guild, previous_message)
             return
     try:
         message = await channel.send(embeds=desired_embeds)
@@ -1046,6 +1047,7 @@ async def update_moderator_documentation(guild: discord.Guild) -> None:
             await previous_message.delete()
         except discord.HTTPException:
             pass
+    await ensure_daily_summary_after_documentation(guild, message)
 
 
 async def daily_log_actions(guild: discord.Guild, summary_day: date) -> Counter[str]:
@@ -1127,6 +1129,87 @@ async def ensure_daily_summary_thread(guild: discord.Guild) -> discord.Thread | 
             return None
     bot.store.set(f"daily_summary_thread:{guild.id}", thread.id)
     return thread
+
+
+async def ensure_daily_summary_after_documentation(
+    guild: discord.Guild,
+    documentation_message: discord.Message,
+) -> None:
+    """Keep the summary starter below documentation without losing summaries."""
+    async with bot.daily_summary_lock:
+        old_thread = await ensure_daily_summary_thread(guild)
+        if old_thread is None or old_thread.id > documentation_message.id:
+            return
+
+        summaries: list[list[discord.Embed]] = []
+        try:
+            async for message in old_thread.history(limit=None, oldest_first=True):
+                embeds = [
+                    discord.Embed.from_dict(embed.to_dict())
+                    for embed in message.embeds
+                    if embed.title and embed.title.startswith("Сводка за ")
+                ]
+                if embeds:
+                    summaries.append(embeds)
+        except discord.HTTPException:
+            logging.exception("Не удалось прочитать старую ветку ежедневных сводок")
+            return
+
+        header_embed = discord.Embed(
+            title=DAILY_SUMMARY_THREAD_NAME,
+            description="Сводки за прошедшие дни публикуются в ветке этого сообщения.",
+            colour=colour(GOLD_EMBED_COLOR_HTML),
+        )
+        new_header: discord.Message | None = None
+        new_thread: discord.Thread | None = None
+        try:
+            new_header = await documentation_message.channel.send(embed=header_embed)
+            new_thread = await documentation_message.channel.create_thread(
+                name=DAILY_SUMMARY_THREAD_NAME,
+                message=new_header,
+                auto_archive_duration=1440,
+                reason="Размещение ежедневных сводок после документации",
+            )
+            for embeds in summaries:
+                await new_thread.send(embeds=embeds)
+
+            copied_summaries = 0
+            async for message in new_thread.history(limit=None):
+                copied_summaries += sum(
+                    1
+                    for embed in message.embeds
+                    if embed.title and embed.title.startswith("Сводка за ")
+                )
+            expected_summaries = sum(len(embeds) for embeds in summaries)
+            if copied_summaries != expected_summaries:
+                raise RuntimeError("Не все ежедневные сводки скопированы")
+        except (discord.HTTPException, RuntimeError):
+            logging.exception("Не удалось переместить ветку ежедневных сводок под документацию")
+            if new_thread is not None:
+                try:
+                    await new_thread.delete(reason="Отмена незавершённого переноса сводок")
+                except discord.HTTPException:
+                    pass
+            elif new_header is not None:
+                try:
+                    await new_header.delete()
+                except discord.HTTPException:
+                    pass
+            return
+
+        bot.store.set(f"daily_summary_header:{guild.id}", new_header.id)
+        bot.store.set(f"daily_summary_thread:{guild.id}", new_thread.id)
+        try:
+            await old_thread.delete(reason="Ветка ежедневных сводок перенесена под документацию")
+        except discord.HTTPException:
+            logging.exception("Не удалось удалить прежнюю ветку ежедневных сводок")
+        try:
+            old_header = await documentation_message.channel.fetch_message(old_thread.id)
+            await old_header.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logging.exception("Не удалось удалить прежний заголовок ежедневных сводок")
 
 
 async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None:
