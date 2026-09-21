@@ -41,6 +41,9 @@ HELP_PANEL_CHANNEL_ID = 1495766775734865930
 APPLICATION_CATEGORY_ID = 1500023409952686190
 TICKET_CATEGORY_ID = 1485653736335605841
 SPAM_PROTECTION_CHANNEL_ID = 1485655876193882363
+SPAM_PROTECTION_IMAGE_URL = "https://discord-webhook.com/uploads/af024169d0e7b10d8dbe04166c1ae58d.jpg"
+SPAM_PROTECTION_EMOJI_NAME = "a8_yagoda_al"
+SPAM_PROTECTION_UPDATED_AT = 1789938000
 LOG_CHANNEL_ID = 1486338493029548094
 DOCUMENTATION_CHANNEL_ID = 1550499602040487996
 DOCUMENTATION_MESSAGE_ID = 1550502972847558701
@@ -946,7 +949,6 @@ async def panels(guild: discord.Guild) -> None:
     items = [
         ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком? Нажмите кнопку ниже и заполните короткую заявку", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
         ("help", HELP_PANEL_CHANNEL_ID, discord.Embed(description="Нужна помощь? Нажмите кнопку, выберите тему обращения и опишите ситуацию", colour=colour(HELP_PANEL_COLOR_HTML)), HelpPanel()),
-        ("spam", SPAM_PROTECTION_CHANNEL_ID, discord.Embed(description="Писать в этом канале **категорически запрещено**. Любое сообщение здесь приведёт к автоматической блокировке на сервере", colour=colour(SPAM_WARNING_COLOR_HTML)), None),
     ]
     for key, channel_id, embed, view in items:
         channel = guild.get_channel(channel_id)
@@ -960,9 +962,51 @@ async def panels(guild: discord.Guild) -> None:
                 await (await channel.fetch_message(message_id)).delete()
             except (discord.NotFound, discord.Forbidden):
                 pass
+    await publish_spam_protection_panel(guild)
     spam = guild.get_channel(SPAM_PROTECTION_CHANNEL_ID)
     if isinstance(spam, discord.TextChannel):
         await spam.set_permissions(guild.default_role, view_channel=True, send_messages=True, reason="Настройка антиспама")
+
+
+def spam_protection_view(guild: discord.Guild) -> discord.ui.LayoutView:
+    emoji = discord.utils.get(guild.emojis, name=SPAM_PROTECTION_EMOJI_NAME)
+    emoji_text = str(emoji) if emoji is not None else f":{SPAM_PROTECTION_EMOJI_NAME}:"
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(discord.ui.Container(
+        discord.ui.MediaGallery(discord.MediaGalleryItem(SPAM_PROTECTION_IMAGE_URL)),
+        discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+        discord.ui.TextDisplay(
+            f"# {emoji_text} Не пишите ничего в этот канал!\n"
+            "Данный канал предназначен исключительно для защиты от автоматического спама. "
+            "Любое сообщение, отправленное в этот канал, повлечет за собой бан участника в Дискорд сервере, "
+            "а также удаление всех его сообщений за последний час."
+        ),
+        discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+        discord.ui.TextDisplay(f"-# Последнее обновление - <t:{SPAM_PROTECTION_UPDATED_AT}:D>"),
+    ))
+    return view
+
+
+async def publish_spam_protection_panel(guild: discord.Guild) -> None:
+    channel = guild.get_channel(SPAM_PROTECTION_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logging.warning("Канал спам-защиты %s не найден", SPAM_PROTECTION_CHANNEL_ID)
+        return
+    previous_id = bot.store.get(f"spam:{guild.id}")
+    try:
+        message = await channel.send(
+            view=spam_protection_view(guild),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logging.exception("Не удалось опубликовать панель спам-защиты")
+        return
+    bot.store.set(f"spam:{guild.id}", message.id)
+    if previous_id and previous_id != message.id:
+        try:
+            await (await channel.fetch_message(previous_id)).delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
 
 
 def moderator_documentation_embeds() -> list[discord.Embed]:
@@ -994,6 +1038,10 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         (
             "Права модераторов",
             "Хелперы могут наказывать игроков, но не хелперов и администраторов. Администраторы могут наказывать хелперов. Ботов, владельца сервера и самого себя наказать нельзя.",
+        ),
+        (
+            "Спам-защита",
+            "Сообщение в канале спам-защиты автоматически блокирует автора на Discord-сервере и удаляет его сообщения за последний час.",
         ),
         (
             "Временные войсы и статистика",
@@ -3335,8 +3383,8 @@ async def on_message(message: discord.Message) -> None:
     if message.channel.id == SPAM_PROTECTION_CHANNEL_ID:
         try:
             await message.delete()
-            await message.author.ban(reason="Сообщение в защищённом от спама канале", delete_message_seconds=0)
-            result = "сообщение удалено, пользователь заблокирован"
+            await message.author.ban(reason="Сообщение в защищённом от спама канале", delete_message_seconds=3600)
+            result = "сообщения за последний час удалены, пользователь заблокирован"
         except discord.Forbidden:
             result = "не удалось заблокировать: недостаточно прав"
         await bot.log(message.guild, "Сработала защита от спама", {
