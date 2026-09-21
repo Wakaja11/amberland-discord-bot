@@ -608,6 +608,7 @@ class Bot(commands.Bot):
                 await setup_moderation(guild)
                 await panels(guild)
                 await restore(guild)
+                await ensure_voice_chat_attachment_permissions(guild)
                 logging.info("Бот запущен: сервер %s, панели и кнопки проверены.", guild.name)
             except Exception:
                 logging.exception("Ошибка настройки сервера %s", guild.id)
@@ -1045,7 +1046,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Временные войсы и статистика",
-            "После входа в канал создания войса игрок получает собственный канал и панель управления. Создатель войса может менять название, лимит, закрывать канал и управлять доступом. Голосовые каналы статистики показывают IP, число участников, игроков с ролью и онлайн Minecraft. Подключение к ним закрыто.",
+            "После входа в канал создания войса игрок получает собственный канал и панель управления. Создатель войса может менять название, лимит, закрывать канал и управлять доступом. В текстовых чатах войсов пользователи могут прикреплять файлы. Голосовые каналы статистики показывают IP, число участников, игроков с ролью и онлайн Minecraft. Подключение к ним закрыто.",
         ),
         (
             "Ежедневная сводка",
@@ -1396,6 +1397,7 @@ async def restore(guild: discord.Guild) -> None:
                     connect=not closed,
                     send_messages=True,
                     read_message_history=True,
+                    attach_files=True,
                     reason="Доступ к чату временного войса для всех пользователей",
                 )
             except discord.HTTPException:
@@ -3133,6 +3135,7 @@ class VoiceControls(discord.ui.View):
             connect=not self.closed,
             send_messages=True,
             read_message_history=True,
+            attach_files=True,
             reason=f"Войс изменён {interaction.user}",
         )
         owner_member = interaction.guild.get_member(self.user_id)
@@ -3170,6 +3173,7 @@ async def create_voice(member: discord.Member) -> None:
             connect=True,
             send_messages=True,
             read_message_history=True,
+            attach_files=True,
         ),
         roles[2]: discord.PermissionOverwrite(view_channel=True, connect=True),
         roles[3]: discord.PermissionOverwrite(view_channel=True, connect=True),
@@ -3178,6 +3182,25 @@ async def create_voice(member: discord.Member) -> None:
     await member.move_to(voice, reason="Перемещение в созданный войс")
     await voice.send(embed=voice_control_embed(), view=VoiceControls(voice.id, member.id, False))
     bot.store.add_voice(voice.id, member.id)
+
+
+async def ensure_voice_chat_attachment_permissions(guild: discord.Guild) -> None:
+    category = guild.get_channel(VOICE_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        return
+    for voice in category.voice_channels:
+        overwrite = voice.overwrites_for(guild.default_role)
+        if overwrite.attach_files is True:
+            continue
+        overwrite.attach_files = True
+        try:
+            await voice.set_permissions(
+                guild.default_role,
+                overwrite=overwrite,
+                reason="Разрешение прикреплять файлы в чатах войсов",
+            )
+        except discord.HTTPException:
+            logging.exception("Не удалось разрешить вложения в чате войса %s", voice.id)
 
 
 async def remove_voice(channel: discord.VoiceChannel) -> None:
@@ -3366,6 +3389,14 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
     if channel.guild.id != GUILD_ID:
         return
     try:
+        if isinstance(channel, discord.VoiceChannel) and channel.category_id == VOICE_CATEGORY_ID:
+            overwrite = channel.overwrites_for(channel.guild.default_role)
+            overwrite.attach_files = True
+            await channel.set_permissions(
+                channel.guild.default_role,
+                overwrite=overwrite,
+                reason="Разрешение прикреплять файлы в чате войса",
+            )
         roles = await moderation_roles(channel.guild)
         await apply_mute_overwrite(channel, roles["mute"])
         for user_id in bot.store.active_user_ids(channel.guild.id, "mute"):
