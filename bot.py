@@ -67,6 +67,7 @@ STATISTICS_MEMBERS_PREFIX = "Участников:"
 STATISTICS_PLAYERS_PREFIX = "Игроков:"
 STATISTICS_ONLINE_PREFIX = "Онлайн:"
 STATISTICS_UPDATE_DELAY_SECONDS = 30
+COMMAND_SYNC_INTERVAL_MINUTES = 5
 MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 GOLD_EMBED_COLOR_HTML = "#F1C40F"
@@ -541,6 +542,7 @@ class Bot(commands.Bot):
         self.moderation_lock = asyncio.Lock()
         self.statistics_lock = asyncio.Lock()
         self.daily_summary_lock = asyncio.Lock()
+        self.command_sync_lock = asyncio.Lock()
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.automatic_bans: set[tuple[int, int]] = set()
 
@@ -588,16 +590,32 @@ class Bot(commands.Bot):
                 logging.exception("Не удалось отправить лог")
 
     async def setup_hook(self) -> None:
-        guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        synced_commands = await self.tree.sync(guild=guild)
-        logging.info("Slash-команды синхронизированы: %s", len(synced_commands))
+        await self.sync_application_commands()
+        if not command_sync_loop.is_running():
+            command_sync_loop.start()
         if not punishment_expiry_loop.is_running():
             punishment_expiry_loop.start()
         if not statistics_refresh_loop.is_running():
             statistics_refresh_loop.start()
         if not daily_summary_loop.is_running():
             daily_summary_loop.start()
+
+    async def sync_application_commands(self) -> None:
+        async with self.command_sync_lock:
+            guild = discord.Object(id=GUILD_ID)
+            global_commands = await self.tree.sync()
+            self.tree.clear_commands(guild=guild)
+            self.tree.copy_global_to(guild=guild)
+            guild_commands = await self.tree.sync(guild=guild)
+            expected_names = {command.name for command in self.tree.get_commands()}
+            global_names = {command.name for command in global_commands}
+            guild_names = {command.name for command in guild_commands}
+            if global_names != expected_names or guild_names != expected_names:
+                raise RuntimeError("Discord зарегистрировал неполный набор slash-команд")
+            logging.info(
+                "Slash-команды синхронизированы глобально и на сервере: %s",
+                len(expected_names),
+            )
 
     async def on_ready(self) -> None:
         if self.started:
@@ -618,6 +636,37 @@ class Bot(commands.Bot):
 
 
 bot = Bot()
+
+
+@tasks.loop(minutes=COMMAND_SYNC_INTERVAL_MINUTES)
+async def command_sync_loop() -> None:
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        expected_names = {command.name for command in bot.tree.get_commands()}
+        global_commands, guild_commands = await asyncio.gather(
+            bot.tree.fetch_commands(),
+            bot.tree.fetch_commands(guild=guild),
+        )
+        global_names = {command.name for command in global_commands}
+        guild_names = {command.name for command in guild_commands}
+        if global_names != expected_names or guild_names != expected_names:
+            logging.warning(
+                "Обнаружено исчезновение slash-команд: глобально %s/%s, на сервере %s/%s",
+                len(global_names),
+                len(expected_names),
+                len(guild_names),
+                len(expected_names),
+            )
+            await bot.sync_application_commands()
+    except discord.HTTPException:
+        logging.exception("Не удалось проверить или восстановить slash-команды")
+    except RuntimeError:
+        logging.exception("Discord зарегистрировал неполный набор slash-команд")
+
+
+@command_sync_loop.before_loop
+async def before_command_sync_loop() -> None:
+    await bot.wait_until_ready()
 
 
 async def staff(interaction: discord.Interaction) -> tuple[discord.Role, discord.Role, discord.Role, discord.Role] | None:
