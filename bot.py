@@ -15,6 +15,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+from content_filter import detect_prohibited_content
+
 
 # ============================================================
 # НАСТРОЙКИ
@@ -48,6 +50,8 @@ SPAM_PROTECTION_IMAGE_URL = "https://discord-webhook.com/uploads/af024169d0e7b10
 SPAM_PROTECTION_EMOJI_NAME = "a8_yagoda_al"
 SPAM_PROTECTION_UPDATED_AT = 1789938000
 LOG_CHANNEL_ID = 1486338493029548094
+GAME_CHAT_CHANNEL_ID = 1485637232877633547
+HELPER_CHAT_CHANNEL_ID = 1485287876118708336
 DOCUMENTATION_CHANNEL_ID = 1550499602040487996
 DOCUMENTATION_MESSAGE_ID = 1550502972847558701
 DAILY_SUMMARY_THREAD_NAME = "Ежедневные сводки"
@@ -106,6 +110,10 @@ MODERATION_ROLE_NAMES = {
 }
 WARNING_LIFETIME_SECONDS = 3 * 24 * 60 * 60
 PUNISHMENT_HISTORY_SECONDS = 30 * 24 * 60 * 60
+AUTOMOD_FIRST_MUTE_SECONDS = 24 * 60 * 60
+AUTOMOD_REPEAT_MUTE_SECONDS = 3 * 24 * 60 * 60
+AUTOMOD_REPEAT_WINDOW_SECONDS = 24 * 60 * 60
+AUTOMOD_REASON = "Нарушение правил общения"
 
 
 # ============================================================
@@ -140,6 +148,15 @@ class Store:
             "CREATE TABLE IF NOT EXISTS daily_metrics ("
             "day TEXT NOT NULL, key TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, "
             "PRIMARY KEY(day,key));"
+            "CREATE TABLE IF NOT EXISTS automod_cases ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER, "
+            "nickname TEXT NOT NULL COLLATE NOCASE, source_channel_id INTEGER NOT NULL, "
+            "source_message_id INTEGER NOT NULL, message_content TEXT NOT NULL, rule TEXT NOT NULL, "
+            "classification TEXT NOT NULL, status TEXT NOT NULL, reviewer_id INTEGER, "
+            "created_at INTEGER NOT NULL, punishment_expires_at INTEGER);"
+            "CREATE INDEX IF NOT EXISTS automod_cases_status ON automod_cases(guild_id,status,created_at);"
+            "CREATE INDEX IF NOT EXISTS automod_cases_user ON automod_cases(guild_id,user_id,punishment_expires_at);"
+            "CREATE INDEX IF NOT EXISTS automod_cases_nickname ON automod_cases(guild_id,nickname,punishment_expires_at);"
         )
         self.db.commit()
 
@@ -351,6 +368,72 @@ class Store:
                 (day.isoformat(),),
             )
         }
+
+    def add_automod_case(
+        self,
+        guild_id: int,
+        user_id: int | None,
+        nickname: str,
+        source_channel_id: int,
+        source_message_id: int,
+        message_content: str,
+        rule: str,
+        classification: str,
+    ) -> int:
+        cursor = self.db.execute(
+            "INSERT INTO automod_cases("
+            "guild_id,user_id,nickname,source_channel_id,source_message_id,message_content,rule,"
+            "classification,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                guild_id,
+                user_id,
+                nickname,
+                source_channel_id,
+                source_message_id,
+                message_content,
+                rule,
+                classification,
+                "pending",
+                int(datetime.now(timezone.utc).timestamp()),
+            ),
+        )
+        self.db.commit()
+        return int(cursor.lastrowid)
+
+    def automod_case(self, case_id: int) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM automod_cases WHERE id=?", (case_id,)).fetchone()
+
+    def resolve_automod_case(
+        self,
+        case_id: int,
+        status: str,
+        *,
+        expected_status: str = "pending",
+        reviewer_id: int | None = None,
+        punishment_expires_at: int | None = None,
+    ) -> bool:
+        cursor = self.db.execute(
+            "UPDATE automod_cases SET status=?,reviewer_id=?,punishment_expires_at=? "
+            "WHERE id=? AND status=?",
+            (status, reviewer_id, punishment_expires_at, case_id, expected_status),
+        )
+        self.db.commit()
+        return cursor.rowcount == 1
+
+    def last_automod_expiry(self, guild_id: int, user_id: int | None, nickname: str) -> int | None:
+        if user_id is not None:
+            row = self.db.execute(
+                "SELECT MAX(punishment_expires_at) FROM automod_cases "
+                "WHERE guild_id=? AND user_id=? AND status='punished'",
+                (guild_id, user_id),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT MAX(punishment_expires_at) FROM automod_cases "
+                "WHERE guild_id=? AND nickname=? COLLATE NOCASE AND status='punished'",
+                (guild_id, nickname),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
 
 
 # ============================================================
@@ -590,6 +673,7 @@ class Bot(commands.Bot):
                 logging.exception("Не удалось отправить лог")
 
     async def setup_hook(self) -> None:
+        self.add_view(AutomodReviewView())
         await self.sync_application_commands()
         if not command_sync_loop.is_running():
             command_sync_loop.start()
@@ -605,15 +689,14 @@ class Bot(commands.Bot):
             guild = discord.Object(id=GUILD_ID)
             global_commands = await self.tree.sync()
             self.tree.clear_commands(guild=guild)
-            self.tree.copy_global_to(guild=guild)
             guild_commands = await self.tree.sync(guild=guild)
             expected_names = {command.name for command in self.tree.get_commands()}
             global_names = {command.name for command in global_commands}
             guild_names = {command.name for command in guild_commands}
-            if global_names != expected_names or guild_names != expected_names:
+            if global_names != expected_names or guild_names:
                 raise RuntimeError("Discord зарегистрировал неполный набор slash-команд")
             logging.info(
-                "Slash-команды синхронизированы глобально и на сервере: %s",
+                "Slash-команды синхронизированы глобально: %s; серверные команды удалены",
                 len(expected_names),
             )
 
@@ -649,13 +732,12 @@ async def command_sync_loop() -> None:
         )
         global_names = {command.name for command in global_commands}
         guild_names = {command.name for command in guild_commands}
-        if global_names != expected_names or guild_names != expected_names:
+        if global_names != expected_names or guild_names:
             logging.warning(
-                "Обнаружено исчезновение slash-команд: глобально %s/%s, на сервере %s/%s",
+                "Нарушена глобальная регистрация slash-команд: глобально %s/%s, серверных %s",
                 len(global_names),
                 len(expected_names),
                 len(guild_names),
-                len(expected_names),
             )
             await bot.sync_application_commands()
     except discord.HTTPException:
@@ -998,6 +1080,343 @@ async def log_punishment(
     )
 
 
+def minecraft_nickname_from_game_message(message: discord.Message) -> str | None:
+    nickname = str(message.author.name).strip()
+    return nickname if re.fullmatch(r"[A-Za-z0-9_]{3,16}", nickname) else None
+
+
+def member_for_minecraft_nickname(guild: discord.Guild, nickname: str) -> discord.Member | None:
+    linked_user_id = bot.store.player_for_nickname(guild.id, nickname)
+    if linked_user_id is not None:
+        linked_member = guild.get_member(linked_user_id)
+        if linked_member is not None:
+            return linked_member
+    return discord.utils.find(
+        lambda candidate: bool(candidate.nick) and candidate.nick.casefold() == nickname.casefold(),
+        guild.members,
+    )
+
+
+def automod_case_id(message: discord.Message | None) -> int | None:
+    if message is None or not message.embeds or not message.embeds[0].footer.text:
+        return None
+    match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
+    return int(match.group(1)) if match else None
+
+
+def automod_duration(guild_id: int, user_id: int | None, nickname: str, now: int) -> int:
+    previous_expiry = bot.store.last_automod_expiry(guild_id, user_id, nickname)
+    if previous_expiry is not None and 0 <= now - previous_expiry < AUTOMOD_REPEAT_WINDOW_SECONDS:
+        return AUTOMOD_REPEAT_MUTE_SECONDS
+    return AUTOMOD_FIRST_MUTE_SECONDS
+
+
+async def delete_detected_message(guild: discord.Guild, channel_id: int, message_id: int) -> None:
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException:
+        logging.exception("Не удалось удалить сообщение, отмеченное автомодерацией: %s", message_id)
+
+
+async def apply_automod_mute(
+    guild: discord.Guild,
+    case_id: int,
+    member: discord.Member,
+    nickname: str,
+    rule: str,
+    *,
+    moderator: discord.Member | None = None,
+) -> tuple[bool, str]:
+    roles = await moderation_roles(guild)
+    now = int(datetime.now(timezone.utc).timestamp())
+    duration_seconds = automod_duration(guild.id, member.id, nickname, now)
+    expires_at = now + duration_seconds
+    rcon_duration = "3d" if duration_seconds == AUTOMOD_REPEAT_MUTE_SECONDS else "1d"
+    duration_period = punishment_period(now, expires_at)
+    reason = f"{AUTOMOD_REASON}: {rule}"
+
+    async with bot.moderation_lock:
+        case = bot.store.automod_case(case_id)
+        if case is None or str(case["status"]) != "pending":
+            return False, "Это сообщение уже обработано"
+        reviewer_id = moderator.id if moderator else None
+        if not bot.store.resolve_automod_case(case_id, "processing", reviewer_id=reviewer_id):
+            return False, "Это сообщение уже обрабатывается"
+        if roles["mute"] in member.roles or bot.store.active_count(guild.id, member.id, "mute"):
+            bot.store.resolve_automod_case(
+                case_id,
+                "already_muted",
+                expected_status="processing",
+                reviewer_id=reviewer_id,
+            )
+            return False, "У пользователя уже есть активный мут"
+        try:
+            await member.add_roles(roles["mute"], reason=audit_reason("Автомут", moderator, reason))
+        except discord.Forbidden:
+            bot.store.resolve_automod_case(case_id, "pending", expected_status="processing")
+            return False, "Боту не хватает прав, чтобы выдать роль мута"
+        except discord.HTTPException:
+            logging.exception("Не удалось выдать роль автомата пользователю %s", member.id)
+            bot.store.resolve_automod_case(case_id, "pending", expected_status="processing")
+            return False, "Discord не принял выдачу роли мута"
+
+        permission_failures = await apply_member_mute_overwrites(member)
+        try:
+            await rcon_command(
+                TEMPMUTE_COMMAND.format(
+                    nickname=nickname,
+                    duration=rcon_duration,
+                    reason=safe_rcon_reason(reason),
+                )
+            )
+        except RconError as error:
+            await restore_member_mute_overwrites(member)
+            try:
+                await member.remove_roles(roles["mute"], reason="Откат: автоматический Minecraft-мут не выполнен")
+            except discord.HTTPException:
+                logging.exception("Не удалось откатить роль автомата пользователя %s", member.id)
+            bot.store.resolve_automod_case(case_id, "pending", expected_status="processing")
+            return False, f"Не удалось выдать мут в Minecraft: {error}"
+
+        bot.store.add_punishment(
+            guild.id,
+            member.id,
+            "mute",
+            moderator.id if moderator else None,
+            reason,
+            expires_at=expires_at,
+            active=True,
+            created_at=now,
+        )
+        if not bot.store.resolve_automod_case(
+            case_id,
+            "punished",
+            expected_status="processing",
+            reviewer_id=reviewer_id,
+            punishment_expires_at=expires_at,
+        ):
+            logging.error("Не удалось завершить случай автомодерации %s после выдачи наказания", case_id)
+
+    case = bot.store.automod_case(case_id)
+    if case is not None:
+        await delete_detected_message(
+            guild,
+            int(case["source_channel_id"]),
+            int(case["source_message_id"]),
+        )
+    notice_sent = await dm(
+        member,
+        punishment_embed("Вам выдан автоматический мут", moderator, reason, duration=duration_period),
+    )
+    action = "Пользователю автоматически выдан мут" if moderator is None else "Пользователю выдан мут после проверки"
+    await log_punishment(
+        guild,
+        action,
+        member,
+        moderator,
+        reason,
+        duration=duration_period,
+        extra_fields={
+            "Minecraft-ник": nickname,
+            "Сообщение": str(case["message_content"])[:1000] if case is not None else "Не найдено",
+            "Источник": f"<#{case['source_channel_id']}>" if case is not None else "Не найден",
+        },
+    )
+    details = f"Мут выдан до <t:{expires_at}:f>"
+    if not notice_sent:
+        details += ". Личное сообщение доставить не удалось"
+    if permission_failures:
+        details += f". Не удалось обновить права в каналах: {permission_failures}"
+    return True, details
+
+
+def automod_review_embed(case: sqlite3.Row, member: discord.Member | None) -> discord.Embed:
+    mention = member.mention if member is not None else "Discord-пользователь не найден"
+    embed = discord.Embed(
+        title="Подозрение на нарушение правил общения",
+        description=f"**{discord.utils.escape_markdown(str(case['nickname']))}** ({mention}) подозревается в нарушении правил общения.",
+        colour=colour(GOLD_EMBED_COLOR_HTML),
+        timestamp=datetime.fromtimestamp(int(case["created_at"]), timezone.utc),
+    )
+    embed.add_field(name="Сообщение", value=discord.utils.escape_markdown(str(case["message_content"]))[:1024] or "Без текста", inline=False)
+    embed.add_field(name="Причина проверки", value=capitalized_field_value(str(case["rule"])), inline=False)
+    embed.add_field(name="Источник", value=f"<#{case['source_channel_id']}>", inline=False)
+    embed.set_footer(text=f"automod_case:{case['id']}")
+    return embed
+
+
+async def send_automod_review(guild: discord.Guild, case_id: int, member: discord.Member | None) -> None:
+    channel = guild.get_channel(HELPER_CHAT_CHANNEL_ID)
+    case = bot.store.automod_case(case_id)
+    if not isinstance(channel, discord.TextChannel) or case is None:
+        logging.error("Не найден хелперский канал или случай автомодерации %s", case_id)
+        return
+    await channel.send(
+        embed=automod_review_embed(case, member),
+        view=AutomodReviewView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def republish_automod_result(
+    interaction: discord.Interaction,
+    case: sqlite3.Row,
+    result: str,
+    colour_html: str,
+) -> None:
+    if not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
+        return
+    embed = discord.Embed(
+        title="Проверка сообщения завершена",
+        description=(
+            f"**Игрок:** {discord.utils.escape_markdown(str(case['nickname']))}\n"
+            f"**Решение:** {result}\n"
+            f"**Модератор:** {interaction.user.mention}\n"
+            f"**Сообщение:** {discord.utils.escape_markdown(str(case['message_content']))[:800]}"
+        ),
+        colour=colour(colour_html),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if interaction.message is not None:
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException:
+            logging.exception("Не удалось удалить обработанную карточку автомодерации %s", case["id"])
+    await interaction.channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+class AutomodReviewView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Наказать",
+        style=discord.ButtonStyle.danger,
+        custom_id="automod:review:punish",
+    )
+    async def punish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+        case_id = automod_case_id(interaction.message)
+        case = bot.store.automod_case(case_id) if case_id is not None else None
+        if case is None:
+            await interaction.response.send_message("Не удалось найти данные этой проверки", ephemeral=True)
+            return
+        if str(case["status"]) != "pending":
+            await interaction.response.send_message("Это сообщение уже обработано", ephemeral=True)
+            return
+        member = interaction.guild.get_member(int(case["user_id"])) if case["user_id"] is not None else None
+        if member is None:
+            await interaction.response.send_message("Не найден Discord-пользователь, связанный с этим Minecraft-ником", ephemeral=True)
+            return
+        if not await moderation_target(interaction, member):
+            return
+        await interaction.response.defer(ephemeral=True)
+        success, result = await apply_automod_mute(
+            interaction.guild,
+            int(case["id"]),
+            member,
+            str(case["nickname"]),
+            str(case["rule"]),
+            moderator=interaction.user,
+        )
+        if success:
+            await republish_automod_result(interaction, case, "Наказание выдано", APPLICATION_REJECTED_COLOR_HTML)
+        await interaction.followup.send(result, ephemeral=True)
+
+    @discord.ui.button(
+        label="Не наказывать",
+        style=discord.ButtonStyle.secondary,
+        custom_id="automod:review:ignore",
+    )
+    async def ignore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await staff(interaction) or not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+        case_id = automod_case_id(interaction.message)
+        case = bot.store.automod_case(case_id) if case_id is not None else None
+        if case is None:
+            await interaction.response.send_message("Не удалось найти данные этой проверки", ephemeral=True)
+            return
+        if not bot.store.resolve_automod_case(int(case["id"]), "ignored", reviewer_id=interaction.user.id):
+            await interaction.response.send_message("Это сообщение уже обработано", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await republish_automod_result(interaction, case, "Не наказывать", APPLICATION_ACCEPTED_COLOR_HTML)
+        await interaction.followup.send("Сообщение оставлено без наказания", ephemeral=True)
+
+
+async def process_automod_message(message: discord.Message) -> bool:
+    if message.guild is None or not message.content.strip():
+        return False
+
+    member: discord.Member | None
+    nickname: str | None
+    is_game_webhook = message.channel.id == GAME_CHAT_CHANNEL_ID and message.webhook_id is not None
+    if is_game_webhook:
+        nickname = minecraft_nickname_from_game_message(message)
+        if nickname is None:
+            return False
+        member = member_for_minecraft_nickname(message.guild, nickname)
+    elif isinstance(message.author, discord.Member) and not message.author.bot:
+        member = message.author
+        nickname = server_minecraft_nickname(member)
+    else:
+        return False
+
+    detection = detect_prohibited_content(
+        message.content,
+        has_mention=bool(message.mentions or message.role_mentions),
+        is_reply=message.reference is not None,
+    )
+    if detection is None:
+        return False
+
+    display_nickname = nickname or (member.display_name if member is not None else str(message.author.name))
+    case_id = bot.store.add_automod_case(
+        message.guild.id,
+        member.id if member is not None else None,
+        display_nickname,
+        message.channel.id,
+        message.id,
+        message.content[:4000],
+        detection.rule,
+        detection.level,
+    )
+
+    requires_review = detection.level == "suspicious" or member is None or nickname is None
+    if member is not None:
+        _, _, helper_role, admin_role = await bot.roles(message.guild)
+        if (
+            member.id == message.guild.owner_id
+            or member.guild_permissions.administrator
+            or helper_role in member.roles
+            or admin_role in member.roles
+        ):
+            requires_review = True
+
+    if requires_review:
+        await send_automod_review(message.guild, case_id, member)
+        return False
+
+    success, error = await apply_automod_mute(
+        message.guild,
+        case_id,
+        member,
+        nickname,
+        detection.rule,
+    )
+    if not success and str((bot.store.automod_case(case_id) or {"status": ""})["status"]) == "pending":
+        logging.error("Автомодерация не смогла выдать наказание: %s", error)
+        await send_automod_review(message.guild, case_id, member)
+    return success
+
+
 async def panels(guild: discord.Guild) -> None:
     items = [
         ("application", APPLICATION_PANEL_CHANNEL_ID, discord.Embed(description="Хотите стать игроком? Нажмите кнопку ниже и заполните короткую заявку", colour=colour(APPLICATION_PANEL_COLOR_HTML)), ApplicationPanel()),
@@ -1117,6 +1536,10 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         (
             "Спам-защита",
             "Сообщение в канале спам-защиты автоматически блокирует автора на Discord-сервере и удаляет его сообщения за последний час.",
+        ),
+        (
+            "Автомодерация общения",
+            "Фильтр работает во всех текстовых каналах и в чате Minecraft. Однозначные дискриминационные оскорбления, призывы к самоубийству и насилию автоматически удаляются и выдают мут в Discord и Minecraft на **1 день**. Если со снятия предыдущего автоматического мута прошло меньше суток, срок составляет **3 дня**. Неоднозначные сообщения отправляются в хелперский канал: нажмите **Наказать** или **Не наказывать**. Обычный мат без адресного оскорбления и лёгкие оскорбления не наказываются.",
         ),
         (
             "Временные войсы и статистика",
@@ -1352,7 +1775,7 @@ async def publish_daily_summary(guild: discord.Guild, summary_day: date) -> None
     tickets_closed = actions["Обращение закрыто модератором"] + actions["Проблема решена игроком"]
     punishment_lines = (
         f"Баны: **{actions['Пользователь заблокирован'] + actions['Пользователь автоматически заблокирован']}** · снято: **{actions['Пользователь разблокирован']}**\n"
-        f"Муты: **{actions['Пользователю выдан мут']}** · снято: **{actions['С пользователя снят мут'] + actions['Мут автоматически снят']}**\n"
+        f"Муты: **{actions['Пользователю выдан мут'] + actions['Пользователю автоматически выдан мут'] + actions['Пользователю выдан мут после проверки']}** · снято: **{actions['С пользователя снят мут'] + actions['Мут автоматически снят']}**\n"
         f"Предупреждения: **{actions['Пользователю выдано предупреждение']}** · снято: **{actions['С пользователя снято предупреждение'] + actions['Предупреждение автоматически снято']}**"
     )
     embed = discord.Embed(
@@ -2992,6 +3415,8 @@ async def process_expired_punishments(guild: discord.Guild, roles: dict[str, dis
             except discord.HTTPException:
                 pass
         nickname = server_minecraft_nickname(member) if member is not None else None
+        if nickname is None:
+            nickname = bot.store.player_nickname(guild.id, int(row["user_id"]))
 
         if kind == "ban":
             if nickname is None:
@@ -3505,9 +3930,9 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not message.guild:
+    if not message.guild:
         return
-    if message.channel.id == SPAM_PROTECTION_CHANNEL_ID:
+    if message.channel.id == SPAM_PROTECTION_CHANNEL_ID and not message.author.bot:
         try:
             await message.delete()
             await message.author.ban(reason="Сообщение в защищённом от спама канале", delete_message_seconds=3600)
@@ -3521,7 +3946,23 @@ async def on_message(message: discord.Message) -> None:
             "Результат": result,
         })
         return
-    await bot.process_commands(message)
+    try:
+        if await process_automod_message(message):
+            return
+    except Exception:
+        logging.exception("Ошибка проверки сообщения системой автомодерации: %s", message.id)
+    if not message.author.bot:
+        await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    if before.content == after.content or after.guild is None:
+        return
+    try:
+        await process_automod_message(after)
+    except Exception:
+        logging.exception("Ошибка проверки изменённого сообщения системой автомодерации: %s", after.id)
 
 
 @bot.event
