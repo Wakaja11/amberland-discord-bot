@@ -639,13 +639,13 @@ class PersistentRconClient:
         # TCP keepalive сам по себе не гарантирует, что Minecraft не закроет
         # простаивающую RCON-сессию. Безопасная команда list поддерживает её
         # активной и сразу обнаруживает разрыв соединения.
-        await self.execute("list")
+        await self.execute("list", log_io=False)
 
     async def close(self) -> None:
         async with self.lock:
             await self.disconnect()
 
-    async def execute(self, command: str) -> str:
+    async def execute(self, command: str, *, log_io: bool = True) -> str:
         if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
             raise RconError("RCON не настроен")
         async with self.lock:
@@ -654,7 +654,8 @@ class PersistentRconClient:
                 if self.reader is None or self.writer is None:
                     raise RconError("RCON-соединение не установлено")
                 command_id = self.next_request_id()
-                logging.info("RCON: отправка команды через постоянное соединение: %s", command)
+                if log_io:
+                    logging.info("RCON: отправка команды через постоянное соединение: %s", command)
                 self.writer.write(rcon_packet(command_id, 2, command))
                 await asyncio.wait_for(self.writer.drain(), timeout=RCON_TIMEOUT_SECONDS)
                 response_id, response_type, response = await asyncio.wait_for(
@@ -663,7 +664,8 @@ class PersistentRconClient:
                 )
                 if response_id != command_id or response_type != 0:
                     raise RconError("RCON вернул некорректный ответ на команду")
-                logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
+                if log_io:
+                    logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
                 return response
             except RconError:
                 await self.disconnect()
@@ -682,11 +684,11 @@ class PersistentRconClient:
 rcon_client = PersistentRconClient()
 
 
-async def rcon_command(command: str, *, retry_safe: bool = False) -> str:
+async def rcon_command(command: str, *, retry_safe: bool = False, log_io: bool = True) -> str:
     attempts = 2 if retry_safe else 1
     for attempt in range(attempts):
         try:
-            return await rcon_client.execute(command)
+            return await rcon_client.execute(command, log_io=log_io)
         except RconError:
             if attempt + 1 < attempts:
                 logging.warning("RCON: безопасная команда не выполнена, повторное подключение")
@@ -3951,7 +3953,7 @@ async def ensure_statistics_channel(
 
 async def minecraft_online_name() -> str:
     try:
-        response = await rcon_command("list", retry_safe=True)
+        response = await rcon_command("list", retry_safe=True, log_io=False)
     except RconError:
         return f"{STATISTICS_ONLINE_PREFIX} недоступен"
     patterns = (
