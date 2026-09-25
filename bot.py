@@ -418,6 +418,16 @@ class Store:
             (message_id,),
         ).fetchone()
 
+    def pending_legacy_automod_case_ids(self, guild_id: int) -> set[int]:
+        return {
+            int(row[0])
+            for row in self.db.execute(
+                "SELECT id FROM automod_cases "
+                "WHERE guild_id=? AND status='pending' AND review_message_id IS NULL",
+                (guild_id,),
+            )
+        }
+
     def set_automod_review_message(self, case_id: int, message_id: int) -> None:
         self.db.execute(
             "UPDATE automod_cases SET review_message_id=? WHERE id=?",
@@ -804,6 +814,7 @@ class Bot(commands.Bot):
         self.started = True
         for guild in self.guilds:
             try:
+                await republish_legacy_automod_reviews(guild)
                 await update_moderator_documentation(guild)
                 await ensure_daily_summary_thread(guild)
                 await self.roles(guild)
@@ -1383,6 +1394,38 @@ async def send_automod_review(guild: discord.Guild, case_id: int, member: discor
         allowed_mentions=discord.AllowedMentions.none(),
     )
     bot.store.set_automod_review_message(case_id, review_message.id)
+
+
+async def republish_legacy_automod_reviews(guild: discord.Guild) -> None:
+    """Replace pending review cards that expose their internal case number."""
+    pending_case_ids = bot.store.pending_legacy_automod_case_ids(guild.id)
+    if not pending_case_ids:
+        return
+    channel = guild.get_channel(HELPER_CHAT_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        async for message in channel.history(limit=None):
+            if not message.embeds or not message.embeds[0].footer.text:
+                continue
+            match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
+            if match is None:
+                continue
+            case_id = int(match.group(1))
+            if case_id not in pending_case_ids:
+                continue
+            case = bot.store.automod_case(case_id)
+            if case is None:
+                pending_case_ids.discard(case_id)
+                continue
+            await message.delete()
+            member = guild.get_member(int(case["user_id"])) if case["user_id"] is not None else None
+            await send_automod_review(guild, case_id, member)
+            pending_case_ids.discard(case_id)
+            if not pending_case_ids:
+                break
+    except discord.HTTPException:
+        logging.exception("Не удалось перепубликовать старые карточки автомодерации")
 
 
 async def finish_automod_review(
