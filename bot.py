@@ -154,10 +154,18 @@ class Store:
             "nickname TEXT NOT NULL COLLATE NOCASE, source_channel_id INTEGER NOT NULL, "
             "source_message_id INTEGER NOT NULL, message_content TEXT NOT NULL, rule TEXT NOT NULL, "
             "classification TEXT NOT NULL, status TEXT NOT NULL, reviewer_id INTEGER, "
-            "created_at INTEGER NOT NULL, punishment_expires_at INTEGER);"
+            "created_at INTEGER NOT NULL, punishment_expires_at INTEGER, review_message_id INTEGER);"
             "CREATE INDEX IF NOT EXISTS automod_cases_status ON automod_cases(guild_id,status,created_at);"
             "CREATE INDEX IF NOT EXISTS automod_cases_user ON automod_cases(guild_id,user_id,punishment_expires_at);"
             "CREATE INDEX IF NOT EXISTS automod_cases_nickname ON automod_cases(guild_id,nickname,punishment_expires_at);"
+        )
+        automod_columns = {
+            str(row[1]) for row in self.db.execute("PRAGMA table_info(automod_cases)")
+        }
+        if "review_message_id" not in automod_columns:
+            self.db.execute("ALTER TABLE automod_cases ADD COLUMN review_message_id INTEGER")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS automod_cases_review_message ON automod_cases(review_message_id)"
         )
         self.db.commit()
 
@@ -403,6 +411,19 @@ class Store:
 
     def automod_case(self, case_id: int) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM automod_cases WHERE id=?", (case_id,)).fetchone()
+
+    def automod_case_for_review_message(self, message_id: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM automod_cases WHERE review_message_id=?",
+            (message_id,),
+        ).fetchone()
+
+    def set_automod_review_message(self, case_id: int, message_id: int) -> None:
+        self.db.execute(
+            "UPDATE automod_cases SET review_message_id=? WHERE id=?",
+            (message_id, case_id),
+        )
+        self.db.commit()
 
     def resolve_automod_case(
         self,
@@ -1188,8 +1209,14 @@ def member_for_minecraft_nickname(guild: discord.Guild, nickname: str) -> discor
 
 
 def automod_case_id(message: discord.Message | None) -> int | None:
-    if message is None or not message.embeds or not message.embeds[0].footer.text:
+    if message is None:
         return None
+    stored_case = bot.store.automod_case_for_review_message(message.id)
+    if stored_case is not None:
+        return int(stored_case["id"])
+    if not message.embeds or not message.embeds[0].footer.text:
+        return None
+    # Совместимость с карточками, опубликованными до скрытия служебного номера.
     match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
     return int(match.group(1)) if match else None
 
@@ -1341,7 +1368,6 @@ def automod_review_embed(case: sqlite3.Row, member: discord.Member | None) -> di
     embed.add_field(name="Сообщение", value=discord.utils.escape_markdown(str(case["message_content"]))[:1024] or "Без текста", inline=False)
     embed.add_field(name="Причина проверки", value=capitalized_field_value(str(case["rule"])), inline=False)
     embed.add_field(name="Источник", value=f"<#{case['source_channel_id']}>", inline=False)
-    embed.set_footer(text=f"automod_case:{case['id']}")
     return embed
 
 
@@ -1351,11 +1377,12 @@ async def send_automod_review(guild: discord.Guild, case_id: int, member: discor
     if not isinstance(channel, discord.TextChannel) or case is None:
         logging.error("Не найден хелперский канал или случай автомодерации %s", case_id)
         return
-    await channel.send(
+    review_message = await channel.send(
         embed=automod_review_embed(case, member),
         view=AutomodReviewView(),
         allowed_mentions=discord.AllowedMentions.none(),
     )
+    bot.store.set_automod_review_message(case_id, review_message.id)
 
 
 async def finish_automod_review(
@@ -1637,7 +1664,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Автомодерация общения",
-            "Фильтр работает во всех текстовых каналах и в чате Minecraft. Однозначные дискриминационные оскорбления, призывы к самоубийству и насилию автоматически удаляются и выдают мут в Discord и Minecraft на **1 день**. Если со снятия предыдущего автоматического мута прошло меньше суток, срок составляет **3 дня**. Неоднозначные сообщения отправляются в хелперский канал: нажмите **Наказать** или **Не наказывать**. После решения карточка удаляется, а вердикт записывается в логи. Обычный мат без адресного оскорбления и лёгкие оскорбления не наказываются.",
+            "Фильтр проверяет текстовые каналы Discord и чат Minecraft. Явное нарушение автоматически удаляется и выдаёт мут в Discord и Minecraft на **1 день**; при повторе в течение суток после окончания мута — на **3 дня**. Неоднозначные сообщения поступают в хелперский канал, где любой модератор может нажать **Наказать** или **Не наказывать**. Решение записывается в логи, а нарушитель получает уведомление в личные сообщения.",
         ),
         (
             "Временные войсы и статистика",
