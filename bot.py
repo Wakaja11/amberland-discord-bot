@@ -1264,31 +1264,35 @@ async def send_automod_review(guild: discord.Guild, case_id: int, member: discor
     )
 
 
-async def republish_automod_result(
+async def finish_automod_review(
     interaction: discord.Interaction,
     case: sqlite3.Row,
-    result: str,
+    verdict: str,
     colour_html: str,
 ) -> None:
-    if not isinstance(interaction.channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
-    embed = discord.Embed(
-        title="Проверка сообщения завершена",
-        description=(
-            f"**Игрок:** {discord.utils.escape_markdown(str(case['nickname']))}\n"
-            f"**Решение:** {result}\n"
-            f"**Модератор:** {interaction.user.mention}\n"
-            f"**Сообщение:** {discord.utils.escape_markdown(str(case['message_content']))[:800]}"
-        ),
-        colour=colour(colour_html),
-        timestamp=datetime.now(timezone.utc),
-    )
     if interaction.message is not None:
         try:
             await interaction.message.delete()
         except discord.HTTPException:
             logging.exception("Не удалось удалить обработанную карточку автомодерации %s", case["id"])
-    await interaction.channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    member = interaction.guild.get_member(int(case["user_id"])) if case["user_id"] is not None else None
+    author = f"{member.mention} (`{case['nickname']}`)" if member is not None else f"`{case['nickname']}`"
+    await bot.log(
+        interaction.guild,
+        "Проверка подозрительного сообщения завершена",
+        {
+            "Автор сообщения": author,
+            "Модератор": interaction.user.mention,
+            "Вердикт": verdict,
+            "Сообщение": str(case["message_content"])[:1000],
+            "Канал": f"<#{case['source_channel_id']}>",
+            "Причина проверки": capitalized_field_value(str(case["rule"])),
+        },
+        avatar_url=str(member.display_avatar.url) if member is not None else None,
+        embed_color_html=colour_html,
+    )
 
 
 class AutomodReviewView(discord.ui.View):
@@ -1327,7 +1331,7 @@ class AutomodReviewView(discord.ui.View):
             moderator=interaction.user,
         )
         if success:
-            await republish_automod_result(interaction, case, "Наказание выдано", APPLICATION_REJECTED_COLOR_HTML)
+            await finish_automod_review(interaction, case, "Наказать", APPLICATION_REJECTED_COLOR_HTML)
         await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(
@@ -1347,7 +1351,7 @@ class AutomodReviewView(discord.ui.View):
             await interaction.response.send_message("Это сообщение уже обработано", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        await republish_automod_result(interaction, case, "Не наказывать", APPLICATION_ACCEPTED_COLOR_HTML)
+        await finish_automod_review(interaction, case, "Не наказывать", APPLICATION_ACCEPTED_COLOR_HTML)
         await interaction.followup.send("Сообщение оставлено без наказания", ephemeral=True)
 
 
@@ -1539,7 +1543,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Автомодерация общения",
-            "Фильтр работает во всех текстовых каналах и в чате Minecraft. Однозначные дискриминационные оскорбления, призывы к самоубийству и насилию автоматически удаляются и выдают мут в Discord и Minecraft на **1 день**. Если со снятия предыдущего автоматического мута прошло меньше суток, срок составляет **3 дня**. Неоднозначные сообщения отправляются в хелперский канал: нажмите **Наказать** или **Не наказывать**. Обычный мат без адресного оскорбления и лёгкие оскорбления не наказываются.",
+            "Фильтр работает во всех текстовых каналах и в чате Minecraft. Однозначные дискриминационные оскорбления, призывы к самоубийству и насилию автоматически удаляются и выдают мут в Discord и Minecraft на **1 день**. Если со снятия предыдущего автоматического мута прошло меньше суток, срок составляет **3 дня**. Неоднозначные сообщения отправляются в хелперский канал: нажмите **Наказать** или **Не наказывать**. После решения карточка удаляется, а вердикт записывается в логи. Обычный мат без адресного оскорбления и лёгкие оскорбления не наказываются.",
         ),
         (
             "Временные войсы и статистика",
