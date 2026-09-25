@@ -46,7 +46,6 @@ _HATEFUL_ROOTS = (
     "хохл",
     "кацап",
     "москал",
-    "укроп",
     "русн",
     "пидор",
     "пидарас",
@@ -67,7 +66,6 @@ _LATIN_HATEFUL_ROOTS = (
     "hohol",
     "kacap",
     "moskal",
-    "ukrop",
     "rusnya",
     "pidor",
     "pidaras",
@@ -141,7 +139,8 @@ _THREAT_RE = re.compile(
 
 _CONTEXT_RE = re.compile(
     r"\b(?:цитат\w*|слово\w*|назвал\w*|называ(?:й|ют|л)\w*|сказал\w*|написал\w*|"
-    r"обсужд\w*|запрещен\w*|осужд\w*|не\s+говори\w*|нельзя\s+говорить)\b",
+    r"обсужд\w*|запрещен\w*|банворд\w*|список\w*|наказыва\w*|осужд\w*|"
+    r"не\s+говори\w*|нельзя\s+говорить)\b",
     re.IGNORECASE,
 )
 
@@ -210,12 +209,11 @@ def detect_prohibited_content(
             group_violence.group(0),
         )
 
-    directly_addressed = has_mention or is_reply or bool(_DIRECT_ADDRESS_RE.search(folded))
     hateful = _root_match(folded, _HATEFUL_ROOTS) or _root_match(plain, _LATIN_HATEFUL_ROOTS)
     if hateful:
         root, matched = hateful
-        level: DetectionLevel = "obvious" if directly_addressed and not contextualized else "suspicious"
-        rule = "адресное дискриминационное оскорбление" if directly_addressed else "возможное дискриминационное оскорбление"
+        level: DetectionLevel = "suspicious" if contextualized else "obvious"
+        rule = "дискриминационное оскорбление" if not contextualized else "возможное цитирование дискриминационного оскорбления"
         return ContentDetection(level, rule, matched or root)
 
     threat = _THREAT_RE.search(folded)
