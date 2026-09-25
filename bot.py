@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import socket
 import sqlite3
 import struct
 from collections import Counter
@@ -537,73 +538,141 @@ async def read_rcon_packet(reader: asyncio.StreamReader) -> tuple[int, int, str]
     return request_id, packet_type, body[8:-2].decode("utf-8", errors="replace")
 
 
-async def rcon_command(command: str) -> str:
-    if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
-        logging.warning("RCON: команда не выполнена — подключение не настроено")
-        bot.store.increment_daily_metric("rcon_errors")
-        raise RconError("RCON не настроен")
+class PersistentRconClient:
+    def __init__(self) -> None:
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+        self.lock = asyncio.Lock()
+        self.request_id = 0
 
-    writer: asyncio.StreamWriter | None = None
-    try:
-        logging.info("RCON: подключение к серверу и отправка команды: %s", command)
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(RCON_HOST, RCON_PORT),
-            timeout=RCON_TIMEOUT_SECONDS,
+    def connected(self) -> bool:
+        return bool(
+            self.reader is not None
+            and self.writer is not None
+            and not self.reader.at_eof()
+            and not self.writer.is_closing()
         )
 
-        auth_id = 1
-        writer.write(rcon_packet(auth_id, 3, RCON_PASSWORD))
-        await asyncio.wait_for(writer.drain(), timeout=RCON_TIMEOUT_SECONDS)
+    def next_request_id(self) -> int:
+        self.request_id = self.request_id % 2_000_000_000 + 1
+        return self.request_id
 
-        authenticated = False
-        for _ in range(2):
-            response_id, response_type, _ = await asyncio.wait_for(
-                read_rcon_packet(reader),
+    async def disconnect(self) -> None:
+        writer = self.writer
+        self.reader = None
+        self.writer = None
+        if writer is None:
+            return
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, RuntimeError):
+            pass
+
+    async def connect(self) -> None:
+        if self.connected():
+            return
+        await self.disconnect()
+        logging.info("RCON: открытие постоянного соединения с %s:%s", RCON_HOST, RCON_PORT)
+        reader: asyncio.StreamReader | None = None
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(RCON_HOST, RCON_PORT),
                 timeout=RCON_TIMEOUT_SECONDS,
             )
-            if response_id == -1:
-                logging.warning("RCON: сервер отклонил пароль")
-                raise RconError("RCON отклонил пароль")
-            if response_id == auth_id and response_type == 2:
-                authenticated = True
-                break
-        if not authenticated:
-            raise RconError("RCON вернул некорректный ответ при авторизации")
+            network_socket = writer.get_extra_info("socket")
+            if network_socket is not None:
+                try:
+                    network_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except OSError:
+                    logging.warning("RCON: не удалось включить TCP keepalive")
 
-        command_id = 2
-        writer.write(rcon_packet(command_id, 2, command))
-        await asyncio.wait_for(writer.drain(), timeout=RCON_TIMEOUT_SECONDS)
-        response_id, response_type, response = await asyncio.wait_for(
-            read_rcon_packet(reader),
-            timeout=RCON_TIMEOUT_SECONDS,
-        )
-        if response_id != command_id or response_type != 0:
-            raise RconError("RCON вернул некорректный ответ на команду")
+            auth_id = self.next_request_id()
+            writer.write(rcon_packet(auth_id, 3, RCON_PASSWORD))
+            await asyncio.wait_for(writer.drain(), timeout=RCON_TIMEOUT_SECONDS)
+            authenticated = False
+            for _ in range(2):
+                response_id, response_type, _ = await asyncio.wait_for(
+                    read_rcon_packet(reader),
+                    timeout=RCON_TIMEOUT_SECONDS,
+                )
+                if response_id == -1:
+                    raise RconError("RCON отклонил пароль")
+                if response_id == auth_id and response_type == 2:
+                    authenticated = True
+                    break
+            if not authenticated:
+                raise RconError("RCON вернул некорректный ответ при авторизации")
+        except Exception:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (OSError, RuntimeError):
+                    pass
+            raise
 
-        logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
-        return response
+        if reader is None or writer is None:
+            raise RconError("RCON-соединение не установлено")
+        self.reader = reader
+        self.writer = writer
+        logging.info("RCON: постоянное соединение установлено")
+
+    async def maintain(self) -> None:
+        if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
+            return
+        async with self.lock:
+            await self.connect()
+
+    async def close(self) -> None:
+        async with self.lock:
+            await self.disconnect()
+
+    async def execute(self, command: str) -> str:
+        if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
+            raise RconError("RCON не настроен")
+        async with self.lock:
+            try:
+                await self.connect()
+                if self.reader is None or self.writer is None:
+                    raise RconError("RCON-соединение не установлено")
+                command_id = self.next_request_id()
+                logging.info("RCON: отправка команды через постоянное соединение: %s", command)
+                self.writer.write(rcon_packet(command_id, 2, command))
+                await asyncio.wait_for(self.writer.drain(), timeout=RCON_TIMEOUT_SECONDS)
+                response_id, response_type, response = await asyncio.wait_for(
+                    read_rcon_packet(self.reader),
+                    timeout=RCON_TIMEOUT_SECONDS,
+                )
+                if response_id != command_id or response_type != 0:
+                    raise RconError("RCON вернул некорректный ответ на команду")
+                logging.info("RCON: команда выполнена. Ответ сервера: %s", response or "без текстового ответа")
+                return response
+            except RconError:
+                await self.disconnect()
+                raise
+            except TimeoutError as error:
+                await self.disconnect()
+                raise RconError("RCON не ответил вовремя") from error
+            except ConnectionRefusedError as error:
+                await self.disconnect()
+                raise RconError("RCON отклонил подключение") from error
+            except (OSError, asyncio.IncompleteReadError, struct.error) as error:
+                await self.disconnect()
+                raise RconError("Не удалось выполнить команду RCON") from error
+
+
+rcon_client = PersistentRconClient()
+
+
+async def rcon_command(command: str) -> str:
+    try:
+        return await rcon_client.execute(command)
     except RconError:
         bot.store.increment_daily_metric("rcon_errors")
-        raise
-    except TimeoutError as error:
-        logging.warning("RCON: сервер не ответил за %s секунд", RCON_TIMEOUT_SECONDS)
-        bot.store.increment_daily_metric("rcon_errors")
-        raise RconError("RCON не ответил вовремя") from error
-    except ConnectionRefusedError as error:
-        logging.warning("RCON: сервер отклонил подключение")
-        bot.store.increment_daily_metric("rcon_errors")
-        raise RconError("RCON отклонил подключение") from error
-    except (OSError, asyncio.IncompleteReadError, struct.error) as error:
         logging.exception("RCON: не удалось выполнить команду")
-        bot.store.increment_daily_metric("rcon_errors")
-        raise RconError("Не удалось выполнить команду RCON") from error
-    finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (OSError, RuntimeError):
-                pass
+        raise
 
 
 async def whitelist_player(nickname: str) -> str:
@@ -675,6 +744,8 @@ class Bot(commands.Bot):
     async def setup_hook(self) -> None:
         self.add_view(AutomodReviewView())
         await self.sync_application_commands()
+        if not rcon_connection_loop.is_running():
+            rcon_connection_loop.start()
         if not command_sync_loop.is_running():
             command_sync_loop.start()
         if not punishment_expiry_loop.is_running():
@@ -683,6 +754,12 @@ class Bot(commands.Bot):
             statistics_refresh_loop.start()
         if not daily_summary_loop.is_running():
             daily_summary_loop.start()
+
+    async def close(self) -> None:
+        if rcon_connection_loop.is_running():
+            rcon_connection_loop.cancel()
+        await rcon_client.close()
+        await super().close()
 
     async def sync_application_commands(self) -> None:
         async with self.command_sync_lock:
@@ -719,6 +796,19 @@ class Bot(commands.Bot):
 
 
 bot = Bot()
+
+
+@tasks.loop(seconds=30)
+async def rcon_connection_loop() -> None:
+    try:
+        await rcon_client.maintain()
+    except (RconError, TimeoutError, ConnectionRefusedError, OSError, asyncio.IncompleteReadError, struct.error):
+        logging.warning("RCON: постоянное соединение недоступно, повтор через 30 секунд")
+
+
+@rcon_connection_loop.before_loop
+async def before_rcon_connection_loop() -> None:
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=COMMAND_SYNC_INTERVAL_MINUTES)
