@@ -636,8 +636,10 @@ class PersistentRconClient:
     async def maintain(self) -> None:
         if not RCON_ENABLED or not RCON_HOST or not RCON_PASSWORD:
             return
-        async with self.lock:
-            await self.connect()
+        # TCP keepalive сам по себе не гарантирует, что Minecraft не закроет
+        # простаивающую RCON-сессию. Безопасная команда list поддерживает её
+        # активной и сразу обнаруживает разрыв соединения.
+        await self.execute("list")
 
     async def close(self) -> None:
         async with self.lock:
@@ -680,13 +682,19 @@ class PersistentRconClient:
 rcon_client = PersistentRconClient()
 
 
-async def rcon_command(command: str) -> str:
-    try:
-        return await rcon_client.execute(command)
-    except RconError:
-        bot.store.increment_daily_metric("rcon_errors")
-        logging.exception("RCON: не удалось выполнить команду")
-        raise
+async def rcon_command(command: str, *, retry_safe: bool = False) -> str:
+    attempts = 2 if retry_safe else 1
+    for attempt in range(attempts):
+        try:
+            return await rcon_client.execute(command)
+        except RconError:
+            if attempt + 1 < attempts:
+                logging.warning("RCON: безопасная команда не выполнена, повторное подключение")
+                continue
+            bot.store.increment_daily_metric("rcon_errors")
+            logging.exception("RCON: не удалось выполнить команду")
+            raise
+    raise RconError("Не удалось выполнить команду RCON")
 
 
 async def whitelist_player(nickname: str) -> str:
@@ -3943,7 +3951,7 @@ async def ensure_statistics_channel(
 
 async def minecraft_online_name() -> str:
     try:
-        response = await rcon_command("list")
+        response = await rcon_command("list", retry_safe=True)
     except RconError:
         return f"{STATISTICS_ONLINE_PREFIX} недоступен"
     patterns = (
