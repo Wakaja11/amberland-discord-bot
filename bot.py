@@ -1105,7 +1105,7 @@ def automod_case_id(message: discord.Message | None) -> int | None:
 
 
 def automod_source_name(channel_id: int) -> str:
-    return "Minecraft чат" if channel_id == GAME_CHAT_CHANNEL_ID else f"<#{channel_id}>"
+    return f"<#{channel_id}>"
 
 
 def automod_duration(guild_id: int, user_id: int | None, nickname: str, now: int) -> int:
