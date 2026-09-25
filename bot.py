@@ -1104,6 +1104,10 @@ def automod_case_id(message: discord.Message | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def automod_source_name(channel_id: int) -> str:
+    return "Minecraft чат" if channel_id == GAME_CHAT_CHANNEL_ID else f"<#{channel_id}>"
+
+
 def automod_duration(guild_id: int, user_id: int | None, nickname: str, now: int) -> int:
     previous_expiry = bot.store.last_automod_expiry(guild_id, user_id, nickname)
     if previous_expiry is not None and 0 <= now - previous_expiry < AUTOMOD_REPEAT_WINDOW_SECONDS:
@@ -1225,7 +1229,7 @@ async def apply_automod_mute(
         extra_fields={
             "Minecraft-ник": nickname,
             "Сообщение": str(case["message_content"])[:1000] if case is not None else "Не найдено",
-            "Источник": f"<#{case['source_channel_id']}>" if case is not None else "Не найден",
+            "Источник": automod_source_name(int(case["source_channel_id"])) if case is not None else "Не найден",
         },
     )
     details = f"Мут выдан до <t:{expires_at}:f>"
@@ -1287,7 +1291,7 @@ async def finish_automod_review(
             "Модератор": interaction.user.mention,
             "Вердикт": verdict,
             "Сообщение": str(case["message_content"])[:1000],
-            "Канал": f"<#{case['source_channel_id']}>",
+            "Канал": automod_source_name(int(case["source_channel_id"])),
             "Причина проверки": capitalized_field_value(str(case["rule"])),
         },
         avatar_url=str(member.display_avatar.url) if member is not None else None,
