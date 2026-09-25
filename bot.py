@@ -1219,17 +1219,21 @@ def member_for_minecraft_nickname(guild: discord.Guild, nickname: str) -> discor
     )
 
 
+def legacy_automod_case_id(message: discord.Message | None) -> int | None:
+    if message is None or not message.embeds or not message.embeds[0].footer.text:
+        return None
+    match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
+    return int(match.group(1)) if match else None
+
+
 def automod_case_id(message: discord.Message | None) -> int | None:
     if message is None:
         return None
     stored_case = bot.store.automod_case_for_review_message(message.id)
     if stored_case is not None:
         return int(stored_case["id"])
-    if not message.embeds or not message.embeds[0].footer.text:
-        return None
     # Совместимость с карточками, опубликованными до скрытия служебного номера.
-    match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
-    return int(match.group(1)) if match else None
+    return legacy_automod_case_id(message)
 
 
 def automod_source_name(channel_id: int) -> str:
@@ -1406,12 +1410,9 @@ async def republish_legacy_automod_reviews(guild: discord.Guild) -> None:
         return
     try:
         async for message in channel.history(limit=None):
-            if not message.embeds or not message.embeds[0].footer.text:
+            case_id = legacy_automod_case_id(message)
+            if case_id is None:
                 continue
-            match = re.fullmatch(r"automod_case:(\d+)", message.embeds[0].footer.text)
-            if match is None:
-                continue
-            case_id = int(match.group(1))
             if case_id not in pending_case_ids:
                 continue
             case = bot.store.automod_case(case_id)
@@ -4099,6 +4100,21 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if not message.guild:
+        return
+    if (
+        bot.user is not None
+        and message.author.id == bot.user.id
+        and message.channel.id == HELPER_CHAT_CHANNEL_ID
+        and legacy_automod_case_id(message) is not None
+    ):
+        try:
+            await message.delete()
+            logging.warning(
+                "Удалена карточка автомодерации старого экземпляра бота: %s",
+                message.id,
+            )
+        except discord.HTTPException:
+            logging.exception("Не удалось удалить старую карточку автомодерации %s", message.id)
         return
     if message.channel.id == SPAM_PROTECTION_CHANNEL_ID and not message.author.bot:
         try:
