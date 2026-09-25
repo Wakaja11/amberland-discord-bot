@@ -111,9 +111,8 @@ MODERATION_ROLE_NAMES = {
 }
 WARNING_LIFETIME_SECONDS = 3 * 24 * 60 * 60
 PUNISHMENT_HISTORY_SECONDS = 30 * 24 * 60 * 60
-AUTOMOD_FIRST_MUTE_SECONDS = 24 * 60 * 60
-AUTOMOD_REPEAT_MUTE_SECONDS = 3 * 24 * 60 * 60
-AUTOMOD_REPEAT_WINDOW_SECONDS = 24 * 60 * 60
+AUTOMOD_SEVERE_MUTE_SECONDS = 30 * 60
+AUTOMOD_LIGHT_MUTE_SECONDS = 5 * 60
 AUTOMOD_REASON = "Нарушение правил общения"
 
 
@@ -451,22 +450,6 @@ class Store:
         )
         self.db.commit()
         return cursor.rowcount == 1
-
-    def last_automod_expiry(self, guild_id: int, user_id: int | None, nickname: str) -> int | None:
-        if user_id is not None:
-            row = self.db.execute(
-                "SELECT MAX(punishment_expires_at) FROM automod_cases "
-                "WHERE guild_id=? AND user_id=? AND status='punished'",
-                (guild_id, user_id),
-            ).fetchone()
-        else:
-            row = self.db.execute(
-                "SELECT MAX(punishment_expires_at) FROM automod_cases "
-                "WHERE guild_id=? AND nickname=? COLLATE NOCASE AND status='punished'",
-                (guild_id, nickname),
-            ).fetchone()
-        return int(row[0]) if row and row[0] is not None else None
-
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -1240,11 +1223,10 @@ def automod_source_name(channel_id: int) -> str:
     return f"<#{channel_id}>"
 
 
-def automod_duration(guild_id: int, user_id: int | None, nickname: str, now: int) -> int:
-    previous_expiry = bot.store.last_automod_expiry(guild_id, user_id, nickname)
-    if previous_expiry is not None and 0 <= now - previous_expiry < AUTOMOD_REPEAT_WINDOW_SECONDS:
-        return AUTOMOD_REPEAT_MUTE_SECONDS
-    return AUTOMOD_FIRST_MUTE_SECONDS
+def automod_duration(classification: str) -> tuple[int, str]:
+    if classification == "obvious":
+        return AUTOMOD_SEVERE_MUTE_SECONDS, "30m"
+    return AUTOMOD_LIGHT_MUTE_SECONDS, "5m"
 
 
 async def delete_detected_message(guild: discord.Guild, channel_id: int, message_id: int) -> None:
@@ -1271,9 +1253,10 @@ async def apply_automod_mute(
 ) -> tuple[bool, str]:
     roles = await moderation_roles(guild)
     now = int(datetime.now(timezone.utc).timestamp())
-    duration_seconds = automod_duration(guild.id, member.id, nickname, now)
+    stored_case = bot.store.automod_case(case_id)
+    classification = str(stored_case["classification"]) if stored_case is not None else "suspicious"
+    duration_seconds, rcon_duration = automod_duration(classification)
     expires_at = now + duration_seconds
-    rcon_duration = "3d" if duration_seconds == AUTOMOD_REPEAT_MUTE_SECONDS else "1d"
     duration_period = punishment_period(now, expires_at)
     reason = f"{AUTOMOD_REASON}: {rule}"
 
@@ -1708,7 +1691,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Автомодерация общения",
-            "Фильтр проверяет текстовые каналы Discord и чат Minecraft. Явное нарушение автоматически удаляется и выдаёт мут в Discord и Minecraft на **1 день**; при повторе в течение суток после окончания мута — на **3 дня**. Неоднозначные сообщения поступают в хелперский канал, где любой модератор может нажать **Наказать** или **Не наказывать**. Решение записывается в логи, а нарушитель получает уведомление в личные сообщения.",
+            "Фильтр проверяет текстовые каналы Discord и чат Minecraft. За явное грубое нарушение сообщение автоматически удаляется и выдаётся мут в Discord и Minecraft на **30 минут**. Лёгкие и неоднозначные нарушения поступают в хелперский канал: любой модератор может нажать **Наказать** и выдать мут на **5 минут** либо выбрать **Не наказывать**. Решение записывается в логи, а нарушитель получает уведомление в личные сообщения.",
         ),
         (
             "Временные войсы и статистика",
