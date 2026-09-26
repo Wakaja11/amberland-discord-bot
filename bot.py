@@ -719,6 +719,8 @@ class Bot(commands.Bot):
         self.statistics_lock = asyncio.Lock()
         self.daily_summary_lock = asyncio.Lock()
         self.command_sync_lock = asyncio.Lock()
+        self.rcon_available = False
+        self.statistics_online_failures: dict[int, int] = {}
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.automatic_bans: set[tuple[int, int]] = set()
 
@@ -827,7 +829,13 @@ bot = Bot()
 async def rcon_connection_loop() -> None:
     try:
         await rcon_client.maintain()
+        recovered = not bot.rcon_available
+        bot.rcon_available = True
+        if recovered:
+            for guild in bot.guilds:
+                schedule_statistics_update(guild, delay_seconds=0)
     except (RconError, TimeoutError, ConnectionRefusedError, OSError, asyncio.IncompleteReadError, struct.error):
+        bot.rcon_available = False
         logging.warning("RCON: постоянное соединение недоступно, повтор через 30 секунд")
 
 
@@ -3951,11 +3959,11 @@ async def ensure_statistics_channel(
     return channel
 
 
-async def minecraft_online_name() -> str:
+async def minecraft_online_name() -> str | None:
     try:
         response = await rcon_command("list", retry_safe=True, log_io=False)
     except RconError:
-        return f"{STATISTICS_ONLINE_PREFIX} недоступен"
+        return None
     patterns = (
         r"There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online",
         r"(?:онлайн|online)[^\d]*(\d+)\s*(?:из|/|of)\s*(\d+)",
@@ -3985,6 +3993,24 @@ async def update_statistics_channels(guild: discord.Guild) -> None:
         member_count = sum(not member.bot for member in guild.members)
         player_count = sum(not member.bot for member in player_role.members) if player_role else 0
         online_name = await minecraft_online_name()
+        if online_name is None:
+            failure_count = bot.statistics_online_failures.get(guild.id, 0) + 1
+            bot.statistics_online_failures[guild.id] = failure_count
+            previous_online_channel = find_statistics_channel(
+                guild,
+                "online",
+                (STATISTICS_ONLINE_PREFIX,),
+            )
+            previous_name = previous_online_channel.name if previous_online_channel else ""
+            if failure_count < 3 and re.fullmatch(
+                rf"{re.escape(STATISTICS_ONLINE_PREFIX)} \d+/\d+",
+                previous_name,
+            ):
+                online_name = previous_name
+            else:
+                online_name = f"{STATISTICS_ONLINE_PREFIX} недоступен"
+        else:
+            bot.statistics_online_failures[guild.id] = 0
         specifications = (
             ("ip", STATISTICS_IP_NAME, ("IP:",)),
             ("members", f"{STATISTICS_MEMBERS_PREFIX} {member_count}", (STATISTICS_MEMBERS_PREFIX, "Участники:")),
@@ -3995,9 +4021,13 @@ async def update_statistics_channels(guild: discord.Guild) -> None:
             await ensure_statistics_channel(guild, statistic, name, prefixes)
 
 
-async def delayed_statistics_update(guild: discord.Guild) -> None:
+async def delayed_statistics_update(
+    guild: discord.Guild,
+    delay_seconds: float = STATISTICS_UPDATE_DELAY_SECONDS,
+) -> None:
     try:
-        await asyncio.sleep(STATISTICS_UPDATE_DELAY_SECONDS)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
         await update_statistics_channels(guild)
     except asyncio.CancelledError:
         raise
@@ -4009,10 +4039,19 @@ async def delayed_statistics_update(guild: discord.Guild) -> None:
             bot.statistics_update_tasks.pop(guild.id, None)
 
 
-def schedule_statistics_update(guild: discord.Guild) -> None:
+def schedule_statistics_update(
+    guild: discord.Guild,
+    *,
+    delay_seconds: float = STATISTICS_UPDATE_DELAY_SECONDS,
+) -> None:
     current_task = bot.statistics_update_tasks.get(guild.id)
+    if delay_seconds <= 0 and current_task is not None and not current_task.done():
+        current_task.cancel()
+        current_task = None
     if current_task is None or current_task.done():
-        bot.statistics_update_tasks[guild.id] = asyncio.create_task(delayed_statistics_update(guild))
+        bot.statistics_update_tasks[guild.id] = asyncio.create_task(
+            delayed_statistics_update(guild, delay_seconds)
+        )
 
 
 @tasks.loop(minutes=10)
