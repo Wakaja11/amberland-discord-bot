@@ -72,6 +72,7 @@ STATISTICS_MEMBERS_PREFIX = "Участников:"
 STATISTICS_PLAYERS_PREFIX = "Игроков:"
 STATISTICS_ONLINE_PREFIX = "Онлайн:"
 STATISTICS_UPDATE_DELAY_SECONDS = 30
+STATISTICS_CHANNEL_EDIT_INTERVAL_SECONDS = 11 * 60
 COMMAND_SYNC_INTERVAL_MINUTES = 5
 MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
 
@@ -730,8 +731,9 @@ class Bot(commands.Bot):
         self.daily_summary_lock = asyncio.Lock()
         self.command_sync_lock = asyncio.Lock()
         self.rcon_available = False
-        self.statistics_online_failures: dict[int, int] = {}
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
+        self.statistics_channel_update_tasks: dict[int, asyncio.Task[None]] = {}
+        self.statistics_pending_channel_names: dict[int, str] = {}
         self.automatic_bans: set[tuple[int, int]] = set()
 
     def claim_interaction(self, interaction_id: int) -> bool:
@@ -798,6 +800,8 @@ class Bot(commands.Bot):
             rcon_connection_loop.cancel()
         if temporary_voice_cleanup_loop.is_running():
             temporary_voice_cleanup_loop.cancel()
+        for task in self.statistics_channel_update_tasks.values():
+            task.cancel()
         await rcon_client.close()
         await super().close()
 
@@ -4052,6 +4056,18 @@ def statistics_setting_key(guild_id: int, statistic: str) -> str:
     return f"statistics_channel:{guild_id}:{statistic}"
 
 
+def statistics_channel_edit_key(channel_id: int) -> str:
+    return f"statistics_channel_last_edit:{channel_id}"
+
+
+def statistics_online_value_key(guild_id: int) -> str:
+    return f"statistics_online_value:{guild_id}"
+
+
+def statistics_online_maximum_key(guild_id: int) -> str:
+    return f"statistics_online_maximum:{guild_id}"
+
+
 def find_statistics_channel(
     guild: discord.Guild,
     statistic: str,
@@ -4069,6 +4085,59 @@ def find_statistics_channel(
         ),
         None,
     )
+
+
+async def delayed_statistics_channel_rename(channel_id: int) -> None:
+    try:
+        while True:
+            channel = bot.get_channel(channel_id)
+            desired_name = bot.statistics_pending_channel_names.get(channel_id)
+            if not isinstance(channel, discord.VoiceChannel) or desired_name is None:
+                return
+            if channel.name == desired_name:
+                return
+
+            last_edit = bot.store.get(statistics_channel_edit_key(channel_id)) or 0
+            delay = last_edit + STATISTICS_CHANNEL_EDIT_INTERVAL_SECONDS - int(datetime.now(timezone.utc).timestamp())
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            # Берём имя повторно после ожидания: за это время онлайн мог измениться
+            # несколько раз, а Discord нужен только самый свежий результат.
+            desired_name = bot.statistics_pending_channel_names.get(channel_id)
+            if desired_name is None:
+                return
+            channel = bot.get_channel(channel_id)
+            if not isinstance(channel, discord.VoiceChannel):
+                return
+            if channel.name != desired_name:
+                await channel.edit(name=desired_name, reason="Обновление статистики сервера")
+                bot.store.set(
+                    statistics_channel_edit_key(channel_id),
+                    int(datetime.now(timezone.utc).timestamp()),
+                )
+
+            if bot.statistics_pending_channel_names.get(channel_id) == desired_name:
+                return
+    except asyncio.CancelledError:
+        raise
+    except discord.HTTPException:
+        logging.exception("Не удалось переименовать канал статистики %s", channel_id)
+    finally:
+        current_task = asyncio.current_task()
+        if bot.statistics_channel_update_tasks.get(channel_id) is current_task:
+            bot.statistics_channel_update_tasks.pop(channel_id, None)
+            bot.statistics_pending_channel_names.pop(channel_id, None)
+
+
+def schedule_statistics_channel_rename(channel: discord.VoiceChannel, name: str) -> None:
+    bot.statistics_pending_channel_names[channel.id] = name
+    current_task = bot.statistics_channel_update_tasks.get(channel.id)
+    if current_task is None or current_task.done():
+        bot.statistics_channel_update_tasks[channel.id] = asyncio.create_task(
+            delayed_statistics_channel_rename(channel.id)
+        )
 
 
 async def ensure_statistics_channel(
@@ -4101,7 +4170,7 @@ async def ensure_statistics_channel(
             reason="Настройка доступа к каналу статистики",
         )
     if channel.name != name:
-        await channel.edit(name=name, reason="Обновление статистики сервера")
+        schedule_statistics_channel_rename(channel, name)
     return channel
 
 
@@ -4120,6 +4189,8 @@ async def minecraft_online_name() -> str | None:
         if match:
             online, maximum = map(int, match.groups())
             bot.store.update_daily_maximum("peak_online", online)
+            bot.store.set(statistics_online_value_key(GUILD_ID), online)
+            bot.store.set(statistics_online_maximum_key(GUILD_ID), maximum)
             return f"{STATISTICS_ONLINE_PREFIX} {online}/{maximum}"
     logging.warning("Не удалось определить онлайн из ответа Minecraft: %s", response)
     return f"{STATISTICS_ONLINE_PREFIX} неизвестно"
@@ -4140,23 +4211,16 @@ async def update_statistics_channels(guild: discord.Guild) -> None:
         player_count = sum(not member.bot for member in player_role.members) if player_role else 0
         online_name = await minecraft_online_name()
         if online_name is None:
-            failure_count = bot.statistics_online_failures.get(guild.id, 0) + 1
-            bot.statistics_online_failures[guild.id] = failure_count
-            previous_online_channel = find_statistics_channel(
-                guild,
-                "online",
-                (STATISTICS_ONLINE_PREFIX,),
-            )
+            cached_online = bot.store.get(statistics_online_value_key(guild.id))
+            cached_maximum = bot.store.get(statistics_online_maximum_key(guild.id))
+            previous_online_channel = find_statistics_channel(guild, "online", (STATISTICS_ONLINE_PREFIX,))
             previous_name = previous_online_channel.name if previous_online_channel else ""
-            if failure_count < 3 and re.fullmatch(
-                rf"{re.escape(STATISTICS_ONLINE_PREFIX)} \d+/\d+",
-                previous_name,
-            ):
+            if cached_online is not None and cached_maximum is not None:
+                online_name = f"{STATISTICS_ONLINE_PREFIX} {cached_online}/{cached_maximum}"
+            elif re.fullmatch(rf"{re.escape(STATISTICS_ONLINE_PREFIX)} \d+/\d+", previous_name):
                 online_name = previous_name
             else:
                 online_name = f"{STATISTICS_ONLINE_PREFIX} недоступен"
-        else:
-            bot.statistics_online_failures[guild.id] = 0
         specifications = (
             ("ip", STATISTICS_IP_NAME, ("IP:",)),
             ("members", f"{STATISTICS_MEMBERS_PREFIX} {member_count}", (STATISTICS_MEMBERS_PREFIX, "Участники:")),
