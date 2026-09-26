@@ -166,15 +166,20 @@ def _root_match(text: str, roots: tuple[str, ...]) -> tuple[str, str] | None:
             if compact_word.startswith(root):
                 return root, word
 
-    # Отдельно проверяем намеренное разделение букв знаками или пробелами.
+    # Отдельно проверяем намеренное разделение букв. Пробелы нельзя считать
+    # произвольным разделителем: иначе обычное "да у нас" склеивается в "даун".
     for root in roots:
-        separated = r"(?<![a-zа-я0-9])" + r"[\W_]*".join(map(re.escape, root)) + r"[a-zа-я0-9_]*"
-        match = re.search(separated, text, re.IGNORECASE)
-        if match:
-            compact_match = re.sub(r"[^a-zа-я0-9]", "", match.group(0))
-            if compact_match.startswith(_ROOT_EXCEPTIONS):
-                continue
-            return root, match.group(0)
+        boundary = r"(?<![a-zа-я0-9])"
+        suffix = r"[a-zа-я0-9_]*"
+        punctuation_separated = boundary + r"[^\w\s]*".join(map(re.escape, root)) + suffix
+        fully_spaced = boundary + r"(?:[^\w]*\s[^\w]*)".join(map(re.escape, root)) + suffix
+        for pattern in (punctuation_separated, fully_spaced):
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                compact_match = re.sub(r"[^a-zа-я0-9]", "", match.group(0))
+                if compact_match.startswith(_ROOT_EXCEPTIONS):
+                    continue
+                return root, match.group(0)
     return None
 
 
