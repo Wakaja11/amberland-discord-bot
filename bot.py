@@ -230,6 +230,15 @@ class Store:
     def voices(self) -> list[tuple[int, int, bool]]:
         return [(voice_id, owner_id, bool(closed)) for voice_id, owner_id, closed in self.db.execute("SELECT voice_id,owner_id,closed FROM voices")]
 
+    def voices_for_owner(self, owner_id: int) -> list[tuple[int, bool]]:
+        return [
+            (int(voice_id), bool(closed))
+            for voice_id, closed in self.db.execute(
+                "SELECT voice_id,closed FROM voices WHERE owner_id=? ORDER BY voice_id",
+                (owner_id,),
+            )
+        ]
+
     def add_punishment(
         self,
         guild_id: int,
@@ -717,6 +726,7 @@ class Bot(commands.Bot):
         self.interaction_ids: set[int] = set()
         self.moderation_lock = asyncio.Lock()
         self.statistics_lock = asyncio.Lock()
+        self.voice_lock = asyncio.Lock()
         self.daily_summary_lock = asyncio.Lock()
         self.command_sync_lock = asyncio.Lock()
         self.rcon_available = False
@@ -778,12 +788,16 @@ class Bot(commands.Bot):
             punishment_expiry_loop.start()
         if not statistics_refresh_loop.is_running():
             statistics_refresh_loop.start()
+        if not temporary_voice_cleanup_loop.is_running():
+            temporary_voice_cleanup_loop.start()
         if not daily_summary_loop.is_running():
             daily_summary_loop.start()
 
     async def close(self) -> None:
         if rcon_connection_loop.is_running():
             rcon_connection_loop.cancel()
+        if temporary_voice_cleanup_loop.is_running():
+            temporary_voice_cleanup_loop.cancel()
         await rcon_client.close()
         await super().close()
 
@@ -815,6 +829,7 @@ class Bot(commands.Bot):
                 await self.roles(guild)
                 await setup_moderation(guild)
                 await panels(guild)
+                await cleanup_temporary_voices(guild)
                 await restore(guild)
                 await ensure_voice_chat_attachment_permissions(guild)
                 logging.info("Бот запущен: сервер %s, панели и кнопки проверены.", guild.name)
@@ -3850,25 +3865,62 @@ def voice_control_embed() -> discord.Embed:
 
 
 async def create_voice(member: discord.Member) -> None:
-    roles = await bot.roles(member.guild)
-    category = member.guild.get_channel(VOICE_CATEGORY_ID)
-    if not isinstance(category, discord.CategoryChannel):
-        return
-    overwrites = {
-        member.guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            send_messages=True,
-            read_message_history=True,
-            attach_files=True,
-        ),
-        roles[2]: discord.PermissionOverwrite(view_channel=True, connect=True),
-        roles[3]: discord.PermissionOverwrite(view_channel=True, connect=True),
-    }
-    voice = await member.guild.create_voice_channel(f"Войс | {member.display_name}"[:100], category=category, overwrites=overwrites, reason=f"Временный войс для {member}")
-    await member.move_to(voice, reason="Перемещение в созданный войс")
-    await voice.send(embed=voice_control_embed(), view=VoiceControls(voice.id, member.id, False))
-    bot.store.add_voice(voice.id, member.id)
+    async with bot.voice_lock:
+        roles = await bot.roles(member.guild)
+        category = member.guild.get_channel(VOICE_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            return
+
+        for voice_id, _ in bot.store.voices_for_owner(member.id):
+            existing = member.guild.get_channel(voice_id)
+            if not isinstance(existing, discord.VoiceChannel):
+                bot.store.remove_voice(voice_id)
+                continue
+            if existing.members:
+                if member not in existing.members:
+                    await member.move_to(existing, reason="Возврат в существующий временный войс")
+                return
+            try:
+                await existing.delete(reason="Замена пустого временного войса")
+            except discord.NotFound:
+                pass
+            bot.store.remove_voice(existing.id)
+
+        overwrites = {
+            member.guild.default_role: discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+            ),
+            member: discord.PermissionOverwrite(view_channel=True, connect=True),
+            roles[2]: discord.PermissionOverwrite(view_channel=True, connect=True),
+            roles[3]: discord.PermissionOverwrite(view_channel=True, connect=True),
+        }
+        voice = await member.guild.create_voice_channel(
+            f"Войс | {member.display_name}"[:100],
+            category=category,
+            overwrites=overwrites,
+            reason=f"Временный войс для {member}",
+        )
+        bot.store.add_voice(voice.id, member.id)
+        try:
+            await member.move_to(voice, reason="Перемещение в созданный войс")
+        except (discord.HTTPException, asyncio.CancelledError):
+            bot.store.remove_voice(voice.id)
+            try:
+                await voice.delete(reason="Отмена незавершённого создания временного войса")
+            except discord.HTTPException:
+                logging.exception("Не удалось удалить незавершённый временный войс %s", voice.id)
+            raise
+        try:
+            await voice.send(
+                embed=voice_control_embed(),
+                view=VoiceControls(voice.id, member.id, False),
+            )
+        except discord.HTTPException:
+            logging.exception("Не удалось отправить панель управления временным войсом %s", voice.id)
 
 
 async def ensure_voice_chat_attachment_permissions(guild: discord.Guild) -> None:
@@ -3891,10 +3943,104 @@ async def ensure_voice_chat_attachment_permissions(guild: discord.Guild) -> None
 
 
 async def remove_voice(channel: discord.VoiceChannel) -> None:
-    if channel.members or channel.id not in {voice_id for voice_id, _, _ in bot.store.voices()}:
-        return
-    bot.store.remove_voice(channel.id)
-    await channel.delete(reason="Временный войс пуст")
+    async with bot.voice_lock:
+        tracked_ids = {voice_id for voice_id, _, _ in bot.store.voices()}
+        if channel.members or channel.id not in tracked_ids:
+            return
+        try:
+            await channel.delete(reason="Временный войс пуст")
+        except discord.NotFound:
+            bot.store.remove_voice(channel.id)
+        except discord.HTTPException:
+            logging.exception("Не удалось удалить пустой временный войс %s", channel.id)
+        else:
+            bot.store.remove_voice(channel.id)
+
+
+async def cleanup_temporary_voices(guild: discord.Guild) -> None:
+    async with bot.voice_lock:
+        rows = bot.store.voices()
+        tracked_ids = {voice_id for voice_id, _, _ in rows}
+        voices_by_owner: dict[int, list[discord.VoiceChannel]] = {}
+
+        for voice_id, owner_id, _ in rows:
+            voice = guild.get_channel(voice_id)
+            if not isinstance(voice, discord.VoiceChannel):
+                bot.store.remove_voice(voice_id)
+                continue
+            voices_by_owner.setdefault(owner_id, []).append(voice)
+
+        for owner_id, voices in voices_by_owner.items():
+            occupied = [voice for voice in voices if voice.members]
+            if not occupied:
+                for voice in voices:
+                    try:
+                        await voice.delete(reason="Уборка пустого временного войса")
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        logging.exception("Не удалось удалить пустой временный войс %s", voice.id)
+                        continue
+                    bot.store.remove_voice(voice.id)
+                continue
+
+            owner = guild.get_member(owner_id)
+            primary = next(
+                (voice for voice in occupied if owner is not None and owner in voice.members),
+                max(occupied, key=lambda voice: (len(voice.members), -voice.id)),
+            )
+            for duplicate in voices:
+                if duplicate.id == primary.id:
+                    continue
+                moved_all = True
+                for voice_member in list(duplicate.members):
+                    try:
+                        await voice_member.move_to(primary, reason="Объединение дублирующихся временных войсов")
+                    except discord.HTTPException:
+                        moved_all = False
+                        logging.exception(
+                            "Не удалось переместить участника %s из дублирующегося войса %s",
+                            voice_member.id,
+                            duplicate.id,
+                        )
+                if not moved_all or duplicate.members:
+                    continue
+                try:
+                    await duplicate.delete(reason="Удаление дублирующегося временного войса")
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    logging.exception("Не удалось удалить дублирующийся временный войс %s", duplicate.id)
+                    continue
+                bot.store.remove_voice(duplicate.id)
+
+        category = guild.get_channel(VOICE_CATEGORY_ID)
+        if isinstance(category, discord.CategoryChannel):
+            for voice in category.voice_channels:
+                if (
+                    voice.id != VOICE_CREATOR_CHANNEL_ID
+                    and voice.id not in tracked_ids
+                    and voice.name.startswith("Войс | ")
+                    and not voice.members
+                ):
+                    try:
+                        await voice.delete(reason="Удаление осиротевшего временного войса")
+                    except discord.HTTPException:
+                        logging.exception("Не удалось удалить осиротевший временный войс %s", voice.id)
+
+
+@tasks.loop(minutes=1)
+async def temporary_voice_cleanup_loop() -> None:
+    for guild in bot.guilds:
+        try:
+            await cleanup_temporary_voices(guild)
+        except Exception:
+            logging.exception("Не удалось проверить временные войсы сервера %s", guild.id)
+
+
+@temporary_voice_cleanup_loop.before_loop
+async def before_temporary_voice_cleanup_loop() -> None:
+    await bot.wait_until_ready()
 
 
 # ============================================================
