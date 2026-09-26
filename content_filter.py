@@ -35,6 +35,27 @@ _CONFUSABLES = str.maketrans(
     }
 )
 
+
+def _masked_sequence_regex(parts: tuple[str, ...], alphabet: str) -> re.Pattern[str]:
+    """Match a compact/punctuated word or letters deliberately split one by one."""
+    punctuation_separated = r"[^\w\s]*".join(parts)
+    fully_spaced = r"(?:[^\w]*\s[^\w]*)".join(parts)
+    return re.compile(
+        rf"(?<![{alphabet}])(?:{punctuation_separated}|{fully_spaced})(?![{alphabet}])",
+        re.IGNORECASE,
+    )
+
+
+_LATIN_HARD_SLUR_RE = _masked_sequence_regex(
+    ("n", r"[i1!|]", "g", "g", r"[e3]", "r"),
+    "a-z",
+)
+_CYRILLIC_HARD_SLUR_RE = _masked_sequence_regex(
+    ("н", "и", "г", "г", "е", "р"),
+    "а-я",
+)
+_KYS_RE = _masked_sequence_regex(("k", "y", "s"), "a-z")
+
 _HATEFUL_ROOTS = (
     "черножоп",
     "черномаз",
@@ -113,6 +134,7 @@ _LATIN_SEVERE_INSULT_ROOTS = (
 
 _ROOT_EXCEPTIONS = (
     "жидк",  # жидкость, жидкий
+    "уродил",  # уродился, уродилась
 )
 
 _DIRECT_ADDRESS_RE = re.compile(
@@ -122,7 +144,7 @@ _DIRECT_ADDRESS_RE = re.compile(
 )
 
 _SELF_HARM_PATTERNS = (
-    (re.compile(r"\bk[\W_]*y[\W_]*s\b", re.IGNORECASE), "призыв к самоубийству"),
+    (_KYS_RE, "призыв к самоубийству"),
     (re.compile(r"\b(?:убейся|сдохни|выпились|повесься|застрелись)\b", re.IGNORECASE), "призыв к самоубийству или смерти"),
 )
 
@@ -194,10 +216,10 @@ def detect_prohibited_content(
         return None
     contextualized = bool(_CONTEXT_RE.search(folded))
 
-    hard_r = re.search(r"(?<![a-z])n[\W_]*[i1!|][\W_]*g[\W_]*g[\W_]*[e3][\W_]*r(?![a-z])", plain)
+    hard_r = _LATIN_HARD_SLUR_RE.search(plain)
     if hard_r:
         return ContentDetection("obvious", "расистский слур", hard_r.group(0))
-    cyrillic_hard_r = re.search(r"(?<![а-я])н[\W_]*и[\W_]*г[\W_]*г[\W_]*е[\W_]*р(?![а-я])", folded)
+    cyrillic_hard_r = _CYRILLIC_HARD_SLUR_RE.search(folded)
     if cyrillic_hard_r:
         return ContentDetection("obvious", "расистский слур", cyrillic_hard_r.group(0))
 
