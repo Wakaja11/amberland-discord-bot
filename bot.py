@@ -35,6 +35,7 @@ BAN_COMMAND = "ban {nickname} {reason}"
 TEMPBAN_COMMAND = "tempban {nickname} {duration} {reason}"
 UNBAN_COMMAND = "unban {nickname}"
 TEMPMUTE_COMMAND = "tempmute {nickname} {duration} {reason}"
+AUTOMOD_ANNOUNCEMENT_COMMAND = "say Игрок {nickname} получил мут на {duration}. Причина: {reason}"
 UNMUTE_COMMAND = "unmute {nickname}"
 WARN_COMMAND = "warn {nickname} {reason}"
 UNWARN_COMMAND = "unwarn {nickname}"
@@ -1260,10 +1261,24 @@ def automod_source_name(channel_id: int) -> str:
     return f"<#{channel_id}>"
 
 
-def automod_duration(classification: str) -> tuple[int, str]:
+def automod_duration(classification: str) -> tuple[int, str, str]:
     if classification == "obvious":
-        return AUTOMOD_SEVERE_MUTE_SECONDS, "30m"
-    return AUTOMOD_LIGHT_MUTE_SECONDS, "5m"
+        return AUTOMOD_SEVERE_MUTE_SECONDS, "30m", "30 минут"
+    return AUTOMOD_LIGHT_MUTE_SECONDS, "5m", "5 минут"
+
+
+async def announce_automod_mute(nickname: str, duration: str, rule: str) -> bool:
+    command = AUTOMOD_ANNOUNCEMENT_COMMAND.format(
+        nickname=nickname,
+        duration=duration,
+        reason=safe_rcon_reason(capitalized_field_value(rule)),
+    )
+    try:
+        await rcon_command(command)
+    except RconError:
+        logging.warning("Не удалось сообщить в Minecraft-чате об автомуте игрока %s", nickname)
+        return False
+    return True
 
 
 async def delete_detected_message(guild: discord.Guild, channel_id: int, message_id: int) -> None:
@@ -1292,7 +1307,7 @@ async def apply_automod_mute(
     now = int(datetime.now(timezone.utc).timestamp())
     stored_case = bot.store.automod_case(case_id)
     classification = str(stored_case["classification"]) if stored_case is not None else "suspicious"
-    duration_seconds, rcon_duration = automod_duration(classification)
+    duration_seconds, rcon_duration, duration_label = automod_duration(classification)
     expires_at = now + duration_seconds
     duration_period = punishment_period(now, expires_at)
     reason = f"{AUTOMOD_REASON}: {rule}"
@@ -1359,6 +1374,7 @@ async def apply_automod_mute(
         ):
             logging.error("Не удалось завершить случай автомодерации %s после выдачи наказания", case_id)
 
+    announcement_sent = await announce_automod_mute(nickname, duration_label, rule)
     case = bot.store.automod_case(case_id)
     if case is not None:
         await delete_detected_message(
@@ -1389,6 +1405,8 @@ async def apply_automod_mute(
         details += ". Личное сообщение доставить не удалось"
     if permission_failures:
         details += f". Не удалось обновить права в каналах: {permission_failures}"
+    if not announcement_sent:
+        details += ". Сообщение в Minecraft-чат отправить не удалось"
     return True, details
 
 
@@ -1728,7 +1746,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Автомодерация общения",
-            "Фильтр проверяет текстовые каналы Discord и чат Minecraft. За явное грубое нарушение сообщение автоматически удаляется и выдаётся мут в Discord и Minecraft на **30 минут**. Лёгкие и неоднозначные нарушения поступают в хелперский канал: любой модератор может нажать **Наказать** и выдать мут на **5 минут** либо выбрать **Не наказывать**. Решение записывается в логи, а нарушитель получает уведомление в личные сообщения.",
+            "Фильтр проверяет текстовые каналы Discord и чат Minecraft. За явное грубое нарушение сообщение автоматически удаляется и выдаётся мут в Discord и Minecraft на **30 минут**. Лёгкие и неоднозначные нарушения поступают в хелперский канал: любой модератор может нажать **Наказать** и выдать мут на **5 минут** либо выбрать **Не наказывать**. О выданном муте бот сообщает в Minecraft-чате, решение записывается в логи, а нарушитель получает уведомление в личные сообщения.",
         ),
         (
             "Временные войсы и статистика",
