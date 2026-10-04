@@ -35,7 +35,10 @@ BAN_COMMAND = "ban {nickname} {reason}"
 TEMPBAN_COMMAND = "tempban {nickname} {duration} {reason}"
 UNBAN_COMMAND = "unban {nickname}"
 TEMPMUTE_COMMAND = "tempmute {nickname} {duration} {reason}"
-AUTOMOD_ANNOUNCEMENT_COMMAND = "say Игрок {nickname} получил мут на {duration}. Причина: {reason}"
+AUTOMOD_ANNOUNCEMENT_COMMAND = (
+    "me Игрок <#FFBF00>{nickname}</#FFBF00> замучен на "
+    "<#FFBF00>{duration}</#FFBF00>: <#ff4545>{reason}</#ff4545>"
+)
 UNMUTE_COMMAND = "unmute {nickname}"
 WARN_COMMAND = "warn {nickname} {reason}"
 UNWARN_COMMAND = "unwarn {nickname}"
