@@ -13,6 +13,12 @@ class ContentFilterTests(unittest.TestCase):
             "вода у нас холодная",
             "он уродился красивым",
             "жидкость уже остыла",
+            "я хачу домой",
+            "заказал хачапури",
+            "приготовили хачипури",
+            "попробовал хачупури",
+            "hachu est",
+            "hachapuri",
         )
         for message in harmless_messages:
             with self.subTest(message=message):
@@ -29,6 +35,13 @@ class ContentFilterTests(unittest.TestCase):
         for message in ("k.y.s", "k y s", "н.и.г.г.е.р", "н и г г е р"):
             with self.subTest(message=message):
                 self.assertIsNotNone(detect_prohibited_content(message))
+
+    def test_hach_exceptions_do_not_disable_the_slur_filter(self) -> None:
+        for message in ("хач", "хачи", "хачур", "hach"):
+            with self.subTest(message=message):
+                detection = detect_prohibited_content(message)
+                self.assertIsNotNone(detection)
+                self.assertEqual(detection.level, "obvious")
 
 
 if __name__ == "__main__":

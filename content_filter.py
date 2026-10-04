@@ -132,9 +132,20 @@ _LATIN_SEVERE_INSULT_ROOTS = (
     "shluha",
 )
 
-_ROOT_EXCEPTIONS = (
+_EXACT_ROOT_EXCEPTIONS = frozenset((
+    "хачу",  # частая опечатка в слове «хочу»
+    "hachu",
+))
+
+_ROOT_PREFIX_EXCEPTIONS = (
     "жидк",  # жидкость, жидкий
     "уродил",  # уродился, уродилась
+    "хачапур",  # хачапури и производные
+    "хачипур",
+    "хачупур",
+    "hachapur",
+    "hachipur",
+    "hachupur",
 )
 
 _SELF_HARM_PATTERNS = (
@@ -172,11 +183,15 @@ def normalize_content(value: str) -> tuple[str, str]:
     return normalized, normalized.translate(_CONFUSABLES)
 
 
+def _is_root_exception(value: str) -> bool:
+    return value in _EXACT_ROOT_EXCEPTIONS or value.startswith(_ROOT_PREFIX_EXCEPTIONS)
+
+
 def _root_match(text: str, roots: tuple[str, ...]) -> tuple[str, str] | None:
     words = re.findall(r"[a-zа-я0-9_]+", text)
     for word in words:
         compact_word = word.replace("_", "")
-        if compact_word.startswith(_ROOT_EXCEPTIONS):
+        if _is_root_exception(compact_word):
             continue
         for root in roots:
             if compact_word.startswith(root):
@@ -193,7 +208,7 @@ def _root_match(text: str, roots: tuple[str, ...]) -> tuple[str, str] | None:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 compact_match = re.sub(r"[^a-zа-я0-9]", "", match.group(0))
-                if compact_match.startswith(_ROOT_EXCEPTIONS):
+                if _is_root_exception(compact_match):
                     continue
                 return root, match.group(0)
     return None
