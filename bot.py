@@ -112,7 +112,7 @@ MODERATION_ROLE_NAMES = {
     "warn2": "Пред 2",
     "warn3": "Пред 3",
 }
-WARNING_LIFETIME_SECONDS = 3 * 24 * 60 * 60
+WARNING_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 PUNISHMENT_HISTORY_SECONDS = 30 * 24 * 60 * 60
 AUTOMOD_SEVERE_MUTE_SECONDS = 30 * 60
 AUTOMOD_LIGHT_MUTE_SECONDS = 5 * 60
@@ -168,6 +168,11 @@ class Store:
             self.db.execute("ALTER TABLE automod_cases ADD COLUMN review_message_id INTEGER")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS automod_cases_review_message ON automod_cases(review_message_id)"
+        )
+        self.db.execute(
+            "UPDATE punishments SET expires_at=created_at+? "
+            "WHERE kind='warn' AND active=1 AND expires_at IS NOT NULL AND expires_at<created_at+?",
+            (WARNING_LIFETIME_SECONDS, WARNING_LIFETIME_SECONDS),
         )
         self.db.commit()
 
@@ -1731,7 +1736,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Предупреждения",
-            "`/пред ник причина` — выдать предупреждение.\n`/снятьпред ник причина` — снять последнее активное предупреждение.\n\nКаждое предупреждение действует **3 дня**. Если после предыдущего предупреждения ещё не прошло 3 дня, новое прибавляется к активным. Перед выдачей третьего активного предупреждения требуется подтверждение; после выдачи игрок бессрочно блокируется на Minecraft-сервере.",
+            "`/пред ник причина` — выдать предупреждение.\n`/снятьпред ник причина` — снять последнее активное предупреждение.\n\nКаждое предупреждение действует **30 дней**. Если после предыдущего предупреждения ещё не прошло 30 дней, новое прибавляется к активным. Перед выдачей третьего активного предупреждения требуется подтверждение; после выдачи игрок бессрочно блокируется на Minecraft-сервере.",
         ),
         (
             "Формат указания времени",
