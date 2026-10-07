@@ -737,7 +737,12 @@ class Bot(commands.Bot):
         self.voice_lock = asyncio.Lock()
         self.daily_summary_lock = asyncio.Lock()
         self.command_sync_lock = asyncio.Lock()
+        self.started_at = int(datetime.now(timezone.utc).timestamp())
         self.rcon_available = False
+        self.rcon_last_success_at: int | None = None
+        self.rcon_last_error_at: int | None = None
+        self.command_sync_last_success_at: int | None = None
+        self.command_sync_last_error: str | None = None
         self.statistics_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.statistics_channel_update_tasks: dict[int, asyncio.Task[None]] = {}
         self.statistics_pending_channel_names: dict[int, str] = {}
@@ -814,15 +819,21 @@ class Bot(commands.Bot):
 
     async def sync_application_commands(self) -> None:
         async with self.command_sync_lock:
-            guild = discord.Object(id=GUILD_ID)
-            global_commands = await self.tree.sync()
-            self.tree.clear_commands(guild=guild)
-            guild_commands = await self.tree.sync(guild=guild)
-            expected_names = {command.name for command in self.tree.get_commands()}
-            global_names = {command.name for command in global_commands}
-            guild_names = {command.name for command in guild_commands}
-            if global_names != expected_names or guild_names:
-                raise RuntimeError("Discord зарегистрировал неполный набор slash-команд")
+            try:
+                guild = discord.Object(id=GUILD_ID)
+                global_commands = await self.tree.sync()
+                self.tree.clear_commands(guild=guild)
+                guild_commands = await self.tree.sync(guild=guild)
+                expected_names = {command.name for command in self.tree.get_commands()}
+                global_names = {command.name for command in global_commands}
+                guild_names = {command.name for command in guild_commands}
+                if global_names != expected_names or guild_names:
+                    raise RuntimeError("Discord зарегистрировал неполный набор slash-команд")
+            except Exception as error:
+                self.command_sync_last_error = str(error)
+                raise
+            self.command_sync_last_success_at = int(datetime.now(timezone.utc).timestamp())
+            self.command_sync_last_error = None
             logging.info(
                 "Slash-команды синхронизированы глобально: %s; серверные команды удалены",
                 len(expected_names),
@@ -857,11 +868,13 @@ async def rcon_connection_loop() -> None:
         await rcon_client.maintain()
         recovered = not bot.rcon_available
         bot.rcon_available = True
+        bot.rcon_last_success_at = int(datetime.now(timezone.utc).timestamp())
         if recovered:
             for guild in bot.guilds:
                 schedule_statistics_update(guild, delay_seconds=0)
     except (RconError, TimeoutError, ConnectionRefusedError, OSError, asyncio.IncompleteReadError, struct.error):
         bot.rcon_available = False
+        bot.rcon_last_error_at = int(datetime.now(timezone.utc).timestamp())
         logging.warning("RCON: постоянное соединение недоступно, повтор через 30 секунд")
 
 
@@ -1728,7 +1741,7 @@ def moderator_documentation_embeds() -> list[discord.Embed]:
         ),
         (
             "Использование команд",
-            "Команды модерации можно вызывать в любом текстовом канале сервера. Команды, относящиеся к конкретному тикету, используются внутри этого тикета. Сообщения бота о подтверждении, отмене, успешном выполнении или ошибке видит только модератор, вызвавший команду.",
+            "Команды модерации можно вызывать в любом текстовом канале сервера. Команды, относящиеся к конкретному тикету, используются внутри этого тикета. Сообщения бота о подтверждении, отмене, успешном выполнении или ошибке видит только модератор, вызвавший команду. `/статус` показывает администраторам состояние Discord, RCON, базы и фоновых процессов.",
         ),
         (
             "Наказания",
@@ -4429,6 +4442,171 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
     if isinstance(channel, discord.VoiceChannel):
         bot.store.remove_voice(channel.id)
         schedule_statistics_update(channel.guild)
+
+
+def compact_duration(total_seconds: int) -> str:
+    days, remainder = divmod(max(0, total_seconds), 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} д.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes:
+        parts.append(f"{minutes} мин.")
+    if not parts:
+        parts.append(f"{seconds} сек.")
+    return " ".join(parts[:2])
+
+
+def bot_background_loops() -> tuple[tuple[str, tasks.Loop], ...]:
+    return (
+        ("RCON", rcon_connection_loop),
+        ("Slash-команды", command_sync_loop),
+        ("Истечение наказаний", punishment_expiry_loop),
+        ("Статистика", statistics_refresh_loop),
+        ("Временные войсы", temporary_voice_cleanup_loop),
+        ("Ежедневная сводка", daily_summary_loop),
+    )
+
+
+@bot.tree.command(name="статус", description="Показать состояние систем бота")
+@app_commands.default_permissions(administrator=True)
+async def bot_status(interaction: discord.Interaction) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Команда доступна только на сервере", ephemeral=True)
+        return
+    admin_role = interaction.guild.get_role(ADMIN_ROLE_ID)
+    if not interaction.user.guild_permissions.administrator and admin_role not in interaction.user.roles:
+        await interaction.response.send_message("Команда доступна только администраторам", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    latency_ms = round(bot.latency * 1000)
+    required_channels = {
+        "заявки": APPLICATION_PANEL_CHANNEL_ID,
+        "помощь": HELP_PANEL_CHANNEL_ID,
+        "спам-защита": SPAM_PROTECTION_CHANNEL_ID,
+        "логи": LOG_CHANNEL_ID,
+        "Minecraft-чат": GAME_CHAT_CHANNEL_ID,
+        "хелперский чат": HELPER_CHAT_CHANNEL_ID,
+        "документация": DOCUMENTATION_CHANNEL_ID,
+        "создание войса": VOICE_CREATOR_CHANNEL_ID,
+    }
+    missing_channels = [name for name, channel_id in required_channels.items() if interaction.guild.get_channel(channel_id) is None]
+    required_roles = {
+        "Гость": GUEST_ROLE_ID,
+        "Игрок": PLAYER_ROLE_ID,
+        "Хелпер": HELPER_ROLE_ID,
+        "Администратор": ADMIN_ROLE_ID,
+        "Бан": BAN_ROLE_ID,
+    }
+    missing_roles = [name for name, role_id in required_roles.items() if interaction.guild.get_role(role_id) is None]
+
+    stopped_loops = [name for name, loop in bot_background_loops() if not loop.is_running()]
+    loop_lines = [
+        f"{'✅' if loop.is_running() else '❌'} {name}"
+        for name, loop in bot_background_loops()
+    ]
+
+    database_error: str | None = None
+    active_punishments = pending_reviews = tracked_voices = 0
+    database_size = 0
+    try:
+        bot.store.db.execute("SELECT 1").fetchone()
+        active_punishments = int(bot.store.db.execute(
+            "SELECT COUNT(*) FROM punishments WHERE active=1"
+        ).fetchone()[0])
+        pending_reviews = int(bot.store.db.execute(
+            "SELECT COUNT(*) FROM automod_cases WHERE status IN ('pending','processing')"
+        ).fetchone()[0])
+        tracked_voices = int(bot.store.db.execute("SELECT COUNT(*) FROM voices").fetchone()[0])
+        database_size = os.path.getsize(DB_FILE)
+    except (sqlite3.Error, OSError) as error:
+        database_error = str(error)
+
+    online_channel = find_statistics_channel(interaction.guild, "online", (STATISTICS_ONLINE_PREFIX,))
+    online_text = online_channel.name if online_channel is not None else "канал не найден"
+    rcon_last_seen = (
+        f"<t:{bot.rcon_last_success_at}:R>"
+        if bot.rcon_last_success_at is not None
+        else "ответов ещё не было"
+    )
+    command_sync = (
+        f"<t:{bot.command_sync_last_success_at}:R>"
+        if bot.command_sync_last_success_at is not None
+        else "ещё не завершалась"
+    )
+    pending_statistics = len(bot.statistics_channel_update_tasks)
+
+    critical = bool(database_error or missing_channels or missing_roles or stopped_loops)
+    warning = bool(
+        not bot.rcon_available
+        or latency_ms >= 500
+        or pending_statistics
+        or bot.command_sync_last_error
+    )
+    if critical:
+        state, state_colour = "🔴 Требуется вмешательство", APPLICATION_REJECTED_COLOR_HTML
+    elif warning:
+        state, state_colour = "🟡 Частичные проблемы", GOLD_EMBED_COLOR_HTML
+    else:
+        state, state_colour = "🟢 Всё работает", APPLICATION_ACCEPTED_COLOR_HTML
+
+    embed = discord.Embed(
+        title="Состояние AmberLand Bot",
+        description=state,
+        colour=colour(state_colour),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Discord",
+        value=(
+            f"✅ Соединение установлено\n"
+            f"{'✅' if latency_ms < 500 else '⚠️'} Задержка: **{latency_ms} мс**\n"
+            f"✅ Команд загружено: **{len(bot.tree.get_commands())}**\n"
+            f"{'✅' if bot.command_sync_last_error is None else '⚠️'} Последняя синхронизация: {command_sync}\n"
+            f"{'✅' if not pending_statistics else '⚠️'} Отложено обновлений статистики: **{pending_statistics}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Minecraft",
+        value=(
+            f"{'✅' if bot.rcon_available else '❌'} RCON: "
+            f"**{'подключён' if bot.rcon_available else 'недоступен'}**\n"
+            f"Последний успешный ответ: {rcon_last_seen}\n"
+            f"Статистика: **{discord.utils.escape_markdown(online_text)}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Фоновые процессы", value="\n".join(loop_lines), inline=False)
+    if database_error is None:
+        embed.add_field(
+            name="База данных",
+            value=(
+                f"✅ Доступна · **{database_size / 1024:.1f} КиБ**\n"
+                f"Активных наказаний: **{active_punishments}**\n"
+                f"Ожидают проверки: **{pending_reviews}**\n"
+                f"Временных войсов: **{tracked_voices}**"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="База данных", value="❌ Недоступна", inline=False)
+    configuration_lines = [
+        f"{'✅' if not missing_channels else '❌'} Обязательные каналы",
+        f"{'✅' if not missing_roles else '❌'} Обязательные роли",
+    ]
+    if missing_channels:
+        configuration_lines.append(f"Нет каналов: {', '.join(missing_channels)}")
+    if missing_roles:
+        configuration_lines.append(f"Нет ролей: {', '.join(missing_roles)}")
+    embed.add_field(name="Конфигурация", value="\n".join(configuration_lines), inline=False)
+    embed.set_footer(text=f"Бот работает {compact_duration(now - bot.started_at)} · проверка не отправляет внешние запросы")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="установка", description="Проверить панели бота")
