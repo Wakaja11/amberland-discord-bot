@@ -74,7 +74,7 @@ _HATEFUL_ROOTS = (
     "трансух",
     "даун",
     "аутист",
-    "шизофрен",
+    "шизофреник",
     "инвалид",
 )
 
@@ -94,7 +94,7 @@ _LATIN_HATEFUL_ROOTS = (
     "transuha",
     "daun",
     "autist",
-    "shizofren",
+    "shizofrenik",
 )
 
 _SEVERE_INSULT_ROOTS = (
@@ -131,6 +131,90 @@ _LATIN_SEVERE_INSULT_ROOTS = (
     "imbecil",
     "shluha",
 )
+
+# Корни нельзя проверять обычным startswith: тогда «даунтаун», «жидкость»
+# или «хачапури» ошибочно становятся нарушениями. Для каждого корня перечислены
+# только окончания, которые образуют формы самого запрещённого слова.
+_COMMON_NOUN_SUFFIXES = frozenset((
+    "", "а", "у", "ом", "е", "ы", "и", "ов", "ей", "ам", "ям", "ами", "ями", "ах", "ях",
+))
+_COMMON_LATIN_SUFFIXES = frozenset((
+    "", "a", "u", "om", "e", "y", "i", "ov", "ey", "am", "ami", "ah",
+))
+_ADJECTIVE_SUFFIXES = frozenset((
+    "ый", "ая", "ое", "ые", "ого", "ой", "ому", "ым", "ую", "ых", "ыми",
+))
+
+_ROOT_SUFFIXES: dict[str, frozenset[str]] = {
+    "черножоп": _ADJECTIVE_SUFFIXES,
+    "черномаз": _ADJECTIVE_SUFFIXES,
+    "чурк": frozenset(("а", "и", "у", "е", "ой", "ою", "ам", "ами", "ах")),
+    "хач": _COMMON_NOUN_SUFFIXES | frozenset((
+        "ур", "ура", "уру", "уром", "уре", "уры", "уров", "урам", "урами", "урах",
+    )),
+    "жидяр": frozenset(("а", "у", "е", "ой", "ою", "ы", "ам", "ами", "ах")),
+    "жид": _COMMON_NOUN_SUFFIXES,
+    "хохол": frozenset(("", "ы")),
+    "хохл": frozenset(("а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах")),
+    "кацап": _COMMON_NOUN_SUFFIXES,
+    "москал": frozenset(("ь", "я", "ю", "ем", "е", "и", "ей", "ям", "ями", "ях")),
+    "русн": frozenset(("я", "ю", "е", "и", "ей")),
+    "пидор": _COMMON_NOUN_SUFFIXES,
+    "пидарас": _COMMON_NOUN_SUFFIXES,
+    "гомик": _COMMON_NOUN_SUFFIXES,
+    "трансух": frozenset(("а", "и", "у", "е", "ой", "ою", "ам", "ами", "ах")),
+    "даун": _COMMON_NOUN_SUFFIXES | frozenset((
+        "ский", "ская", "ское", "ские", "ского", "ской", "скому", "ским", "скую", "ских", "скими",
+    )),
+    "аутист": _COMMON_NOUN_SUFFIXES,
+    "шизофреник": _COMMON_NOUN_SUFFIXES,
+    "инвалид": _COMMON_NOUN_SUFFIXES,
+    "chernozhop": frozenset(("iy", "aya", "oe", "ye", "ogo", "omu", "ym", "uyu", "yh", "ymi")),
+    "chernomaz": frozenset(("iy", "aya", "oe", "ye", "ogo", "omu", "ym", "uyu", "yh", "ymi")),
+    "churka": _COMMON_LATIN_SUFFIXES,
+    "hach": _COMMON_LATIN_SUFFIXES | frozenset(("ur", "ura", "uru", "urom", "ure", "ury", "urov")),
+    "zhid": _COMMON_LATIN_SUFFIXES,
+    "hohol": _COMMON_LATIN_SUFFIXES,
+    "kacap": _COMMON_LATIN_SUFFIXES,
+    "moskal": _COMMON_LATIN_SUFFIXES,
+    "rusnya": _COMMON_LATIN_SUFFIXES,
+    "pidor": _COMMON_LATIN_SUFFIXES,
+    "pidaras": _COMMON_LATIN_SUFFIXES,
+    "gomik": _COMMON_LATIN_SUFFIXES,
+    "transuha": _COMMON_LATIN_SUFFIXES,
+    "daun": _COMMON_LATIN_SUFFIXES,
+    "autist": _COMMON_LATIN_SUFFIXES,
+    "shizofrenik": _COMMON_LATIN_SUFFIXES,
+    "мраз": frozenset(("ь", "и", "ью", "ей", "ям", "ями", "ях")),
+    "твар": frozenset(("ь", "и", "ью", "ей", "ям", "ями", "ях")),
+    "уебок": frozenset(("",)),
+    "уебан": _COMMON_NOUN_SUFFIXES,
+    "долбоеб": _COMMON_NOUN_SUFFIXES,
+    "мудак": _COMMON_NOUN_SUFFIXES,
+    "гнид": frozenset(("а", "ы", "е", "у", "ой", "ою", "ам", "ами", "ах")),
+    "чмо": frozenset(("",)),
+    "падаль": frozenset(("", "ю", "и")),
+    "ничтож": frozenset(("ество", "ества", "еству", "еством", "естве", "ествах", "ествами")),
+    "урод": _COMMON_NOUN_SUFFIXES,
+    "дегенерат": _COMMON_NOUN_SUFFIXES,
+    "кретин": _COMMON_NOUN_SUFFIXES,
+    "дебил": _COMMON_NOUN_SUFFIXES,
+    "имбецил": _COMMON_NOUN_SUFFIXES,
+    "шлюх": frozenset(("а", "и", "е", "у", "ой", "ою", "ам", "ами", "ах")),
+    "проститут": frozenset(("ка", "ки", "ке", "ку", "кой", "кою", "ок", "кам", "ками", "ках")),
+    "mraz": _COMMON_LATIN_SUFFIXES,
+    "tvar": _COMMON_LATIN_SUFFIXES,
+    "uebok": _COMMON_LATIN_SUFFIXES,
+    "dolboeb": _COMMON_LATIN_SUFFIXES,
+    "mudak": _COMMON_LATIN_SUFFIXES,
+    "gnida": _COMMON_LATIN_SUFFIXES,
+    "chmo": frozenset(("",)),
+    "urod": _COMMON_LATIN_SUFFIXES,
+    "degenerat": _COMMON_LATIN_SUFFIXES,
+    "debil": _COMMON_LATIN_SUFFIXES,
+    "imbecil": _COMMON_LATIN_SUFFIXES,
+    "shluha": _COMMON_LATIN_SUFFIXES,
+}
 
 _EXACT_ROOT_EXCEPTIONS = frozenset((
     "хачу",  # частая опечатка в слове «хочу»
@@ -187,14 +271,18 @@ def _is_root_exception(value: str) -> bool:
     return value in _EXACT_ROOT_EXCEPTIONS or value.startswith(_ROOT_PREFIX_EXCEPTIONS)
 
 
+def _is_prohibited_word(value: str, root: str) -> bool:
+    if _is_root_exception(value) or not value.startswith(root):
+        return False
+    return value[len(root):] in _ROOT_SUFFIXES[root]
+
+
 def _root_match(text: str, roots: tuple[str, ...]) -> tuple[str, str] | None:
     words = re.findall(r"[a-zа-я0-9_]+", text)
     for word in words:
         compact_word = word.replace("_", "")
-        if _is_root_exception(compact_word):
-            continue
         for root in roots:
-            if compact_word.startswith(root):
+            if _is_prohibited_word(compact_word, root):
                 return root, word
 
     # Отдельно проверяем намеренное разделение букв. Пробелы нельзя считать
@@ -205,12 +293,10 @@ def _root_match(text: str, roots: tuple[str, ...]) -> tuple[str, str] | None:
         punctuation_separated = boundary + r"[^\w\s]*".join(map(re.escape, root)) + suffix
         fully_spaced = boundary + r"(?:[^\w]*\s[^\w]*)".join(map(re.escape, root)) + suffix
         for pattern in (punctuation_separated, fully_spaced):
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
                 compact_match = re.sub(r"[^a-zа-я0-9]", "", match.group(0))
-                if _is_root_exception(compact_match):
-                    continue
-                return root, match.group(0)
+                if _is_prohibited_word(compact_match, root):
+                    return root, match.group(0)
     return None
 
 
